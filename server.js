@@ -1,42 +1,32 @@
-const express = require("express");
-const { runAgent } = require("./agent");
+import express from "express";
+import { runCheck } from "./agent.js";
 
 const app = express();
 app.use(express.json());
 
-// ✅ Health check (useful for Railway)
 app.get("/", (req, res) => {
-  res.send("✅ OneTrust Agent is running");
+  res.send("✅ OT checker running");
 });
 
-// ✅ Main endpoint
 app.post("/check", async (req, res) => {
   try {
     const { url } = req.body;
 
     if (!url) {
-      return res.status(400).json({
-        error: "Missing url in request body"
-      });
+      return res.status(400).json({ error: "Missing URL" });
     }
 
-    console.log("🔍 Checking:", url);
-
-    const result = await runAgent(url);
+    const result = await runCheck(url);
 
     res.json(result);
-
   } catch (err) {
-    console.error("❌ Error:", err);
-
-    res.status(500).json({
-      error: "Failed to process request"
-    });
+    console.error(err);
+    res.status(500).json({ error: "Something failed" });
   }
 });
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Listening on ${PORT}`);
 });
