@@ -1,8 +1,7 @@
 import { chromium } from "playwright";
 
-function normal();function normaliseUrl(url) {
-  if (!trimmed) return "";
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+function normaliseUrl(url) {
+  const trimmed return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;  const trimmed = (url || "").trim();
 }
 
 function cleanUdid(udid = "") {
@@ -85,7 +84,7 @@ export async function runCheck(inputUrl) {
     const checkedHost = new URL(targetUrl).hostname || "";
     const configDomain = capturedConfig?.Domain ?? "";
 
-    // ✅ FIXED: ALWAYS BOOLEAN (no nulls, no undefined)
+    // ✅ BOOLEAN FIX (unchanged logic, safe types)
     let domainScopeValid = false;
     let domainOutOfScope = false;
 
@@ -103,7 +102,7 @@ export async function runCheck(inputUrl) {
       domainOutOfScope = false;
     }
 
-    // ✅ EXTRA GUARANTEE (critical for Copilot)
+    // ✅ FINAL SAFE CAST
     domainScopeValid = Boolean(domainScopeValid);
     domainOutOfScope = Boolean(domainOutOfScope);
 
@@ -172,3 +171,4 @@ export async function runCheck(inputUrl) {
     if (browser) await browser.close().catch(() => {});
   }
 }
+  if (!trimmed) return "";
