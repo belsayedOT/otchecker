@@ -1,0 +1,13 @@
+{
+  "name": "ot-agent",
+  "version": "1.0.0",
+  "description": "OneTrust checker API using Playwright",
+  "main": "server.js",
+  "scripts": {
+    "start": "npx playwright install chromium && node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "playwright": "^1.44.0"
+  }
+}
