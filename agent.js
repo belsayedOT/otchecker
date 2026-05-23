@@ -2,7 +2,9 @@ import { chromium } from "playwright";
 import fs from "fs";
 
 function normaliseUrl(url) {
-  return url.startsWith("http") ? url : `https://${url}`;
+  const trimmed = (url || "").trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 function cleanUdid(udid = "") {
@@ -25,13 +27,32 @@ function extractBodyPreview(text = "", max = 3000) {
   return text.length > max ? `${text.slice(0, max)}... [truncated]` : text;
 }
 
+function mkRecommendation(severity, message) {
+  return { severity, message };
+}
+
+function computeSeverity(issues) {
+  // Simple, practical scoring:
+  // HIGH: access denied or duplicates
+  // MED: not in head or scripts before OT
+  // LOW: missing config only
+  if (issues.some(i => i.severity === "HIGH")) return "HIGH";
+  if (issues.some(i => i.severity === "MEDIUM")) return "MEDIUM";
+  if (issues.length > 0) return "LOW";
+  return "NONE";
+}
+
 /**
- * ✅ THIS IS WHAT server.js IMPORTS
+ * ✅ This is what server.js imports
+ * import { runCheck } from "./agent.js";
  */
-export async function runCheck(targetUrl) {
+export async function runCheck(inputUrl) {
+  const targetUrl = normaliseUrl(inputUrl);
   if (!targetUrl) throw new Error("url is required");
 
-  // ✅ move all “per run” vars INSIDE the function so requests don’t share state
+  const DEBUG = process.env.DEBUG_ARTIFACTS === "true";
+
+  // Per-run state (never global)
   const notes = [];
   const apiCalls = [];
   const otStubNetworkCalls = [];
@@ -42,14 +63,11 @@ export async function runCheck(targetUrl) {
   let autoBlockResponseDetails = null;
   let geoLocationResponseDetails = null;
 
-  const DEBUG = process.env.DEBUG_ARTIFACTS === "true";
-
   let browser = null;
 
   try {
     browser = await chromium.launch({
       headless: true,
-      // important in hosted environments
       args: ["--no-sandbox", "--disable-dev-shm-usage"]
     });
 
@@ -60,6 +78,7 @@ export async function runCheck(targetUrl) {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     });
 
+    // Track key requests
     page.on("request", request => {
       const url = request.url();
       const lowerUrl = url.toLowerCase();
@@ -81,6 +100,7 @@ export async function runCheck(targetUrl) {
       }
     });
 
+    // Track responses + capture JSON bodies
     page.on("response", async response => {
       const url = response.url();
       const request = response.request();
@@ -93,14 +113,16 @@ export async function runCheck(targetUrl) {
         status: response.status()
       };
 
+      // Keep lightweight log unless DEBUG
       apiCalls.push(responseSummary);
 
+      // Capture AutoBlock body
       if (lowerUrl.includes("otautoblock.js")) {
         try {
           const bodyText = await response.text();
           autoBlockResponseDetails = {
             ...responseSummary,
-            headers: response.headers(),
+            headers: DEBUG ? response.headers() : undefined,
             bodyPreview: extractBodyPreview(bodyText),
             bodyLength: bodyText.length
           };
@@ -109,15 +131,20 @@ export async function runCheck(targetUrl) {
         }
       }
 
+      // Capture geolocation response (if present)
       if (lowerUrl.includes("/v1/geo/location")) {
         try {
           const bodyText = await response.text();
           let parsedBody = null;
-          try { parsedBody = JSON.parse(bodyText); } catch { parsedBody = null; }
+          try {
+            parsedBody = JSON.parse(bodyText);
+          } catch {
+            parsedBody = null;
+          }
 
           geoLocationResponseDetails = {
             ...responseSummary,
-            headers: response.headers(),
+            headers: DEBUG ? response.headers() : undefined,
             body: parsedBody ?? bodyText,
             bodyLength: bodyText.length
           };
@@ -126,6 +153,7 @@ export async function runCheck(targetUrl) {
         }
       }
 
+      // Collect *.json responses
       try {
         const urlObj = new URL(url);
         const pathname = urlObj.pathname.toLowerCase();
@@ -140,28 +168,27 @@ export async function runCheck(targetUrl) {
           });
         }
       } catch {
-        notes.push(`Could not process JSON response body: ${url}`);
+        // ignore URL parse errors
       }
     });
 
-    // --- NAVIGATION ---
+    // -------- NAVIGATION --------
     try {
-      await page.goto(normaliseUrl(targetUrl), {
-        waitUntil: "domcontentloaded",
-        timeout: 60000
-      });
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
 
+      // Some sites never settle; don't fail the run because of that.
       await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {
         notes.push("Network did not become idle within 30 seconds.");
       });
 
-      await page.waitForTimeout(15000);
+      // Give async OneTrust requests time
+      await page.waitForTimeout(8000);
     } catch (error) {
       notes.push(`Page navigation issue: ${error.message}`);
     }
 
+    // WAF/CDN detection (your original logic)
     const bodyText = await page.locator("body").innerText().catch(() => "");
-
     if (
       bodyText.includes("Access Denied") ||
       bodyText.includes("You don't have permission to access") ||
@@ -171,7 +198,7 @@ export async function runCheck(targetUrl) {
       notes.push("Access denied by CDN/WAF. Playwright could not access the real page.");
     }
 
-    // --- SCRIPT INSPECTION ---
+    // -------- SCRIPT INSPECTION (DOM + frames) --------
     const allFrameScripts = [];
 
     for (const frame of page.frames()) {
@@ -189,34 +216,55 @@ export async function runCheck(targetUrl) {
             inBody: script.closest("body") !== null
           }))
         );
-
         allFrameScripts.push(...scripts);
       } catch {
         notes.push(`Could not inspect scripts in frame: ${frame.url()}`);
       }
     }
 
-    const stubScripts = allFrameScripts.filter(script => {
-      const src = script.src.toLowerCase();
-      const outerHTML = script.outerHTML.toLowerCase();
-      return src.includes("otsdkstub.js") || outerHTML.includes("otsdkstub.js");
+    const stubScripts = allFrameScripts.filter(s => {
+      const src = (s.src || "").toLowerCase();
+      const html = (s.outerHTML || "").toLowerCase();
+      return src.includes("otsdkstub.js") || html.includes("otsdkstub.js");
     });
 
-    const autoBlockScripts = allFrameScripts.filter(script => {
-      const src = script.src.toLowerCase();
-      const outerHTML = script.outerHTML.toLowerCase();
-      return src.includes("otautoblock.js") || outerHTML.includes("otautoblock.js");
+    const autoBlockScripts = allFrameScripts.filter(s => {
+      const src = (s.src || "").toLowerCase();
+      const html = (s.outerHTML || "").toLowerCase();
+      return src.includes("otautoblock.js") || html.includes("otautoblock.js");
     });
 
+    const firstStubScript = stubScripts[0] || null;
+    const firstAutoBlockScript = autoBlockScripts[0] || null;
+
+    function getScriptsBefore(targetScript, scriptList) {
+      if (!targetScript) return [];
+      return scriptList
+        .filter(s => s.frameUrl === targetScript.frameUrl)
+        .filter(s => s.index < targetScript.index)
+        .map(s => ({
+          index: s.index,
+          src: s.src,
+          id: s.id,
+          parentTagName: s.parentTagName,
+          inHead: s.inHead,
+          inBody: s.inBody
+        }));
+    }
+
+    const scriptsBeforeOtSDKStub = getScriptsBefore(firstStubScript, allFrameScripts);
+    const scriptsBeforeAutoBlock = getScriptsBefore(firstAutoBlockScript, allFrameScripts);
+
+    // -------- Extract data-domain-script --------
     const dataDomainScriptValues = stubScripts
-      .map(script => script.dataDomainScript)
+      .map(s => s.dataDomainScript)
       .filter(Boolean);
 
     const primaryUdid = dataDomainScriptValues[0] || "";
     const productionUdid = cleanUdid(primaryUdid);
     const usingTestScript = isTestScript(primaryUdid);
 
-    // --- CAPTURE UDID JSON ---
+    // -------- Capture UDID JSON --------
     let capturedConfig = null;
     let capturedConfigUrl = "";
 
@@ -238,10 +286,7 @@ export async function runCheck(targetUrl) {
       }
     }
 
-    if (!capturedConfig && productionUdid) {
-      notes.push(`No matching UDID JSON config response was captured for UDID: ${primaryUdid}.`);
-    }
-
+    // -------- Cookies + console checks (optional, useful) --------
     const cookies = await page.context().cookies();
 
     const oneTrustConsoleChecks = {
@@ -250,7 +295,101 @@ export async function runCheck(targetUrl) {
       )
     };
 
-    // ✅ Debug artefacts only when needed
+    // -------- REQUIRED FLAGS (your ask) --------
+    const otSDKStubFound = stubScripts.length > 0 || otStubNetworkCalls.length > 0;
+    const autoBlockEnabled = autoBlockScripts.length > 0 || otAutoBlockNetworkCalls.length > 0;
+
+    const hasDuplicateOtSdkStub = stubScripts.length > 1 || otStubNetworkCalls.length > 1;
+    const hasDuplicateAutoBlock = autoBlockScripts.length > 1 || otAutoBlockNetworkCalls.length > 1;
+
+    const scriptsBeforeOtSdkStub = scriptsBeforeOtSDKStub.length > 0;
+    const scriptsBeforeAutoBlockFlag = scriptsBeforeAutoBlock.length > 0;
+
+    const otSdkStubInHead = firstStubScript?.inHead ?? false;
+    const autoBlockInHead = firstAutoBlockScript?.inHead ?? false;
+
+    // -------- High value: issues + recommendations --------
+    const issues = [];
+    const recommendations = [];
+
+    if (accessDenied) {
+      issues.push(mkRecommendation("HIGH", "Site appears blocked by CDN/WAF (Access Denied)."));
+      recommendations.push(
+        mkRecommendation("HIGH", "Ask customer to allowlist the scanner/requests or test from a non-blocked network.")
+      );
+    }
+
+    if (!otSDKStubFound) {
+      issues.push(mkRecommendation("HIGH", "otSDKStub.js was not detected in DOM or network calls."));
+      recommendations.push(
+        mkRecommendation("HIGH", "Confirm OneTrust script is implemented on the page and not blocked by CSP/WAF.")
+      );
+    }
+
+    if (hasDuplicateOtSdkStub) {
+      issues.push(mkRecommendation("HIGH", "Duplicate otSDKStub.js detected (DOM and/or network)."));
+      recommendations.push(
+        mkRecommendation("HIGH", "Remove duplicate OneTrust script to avoid unpredictable banner/consent behaviour.")
+      );
+    }
+
+    if (hasDuplicateAutoBlock) {
+      issues.push(mkRecommendation("HIGH", "Duplicate otAutoBlock.js detected (DOM and/or network)."));
+      recommendations.push(
+        mkRecommendation("HIGH", "Remove duplicate AutoBlock include. Duplicate autoblock can break script injection.")
+      );
+    }
+
+    if (otSDKStubFound && !otSdkStubInHead) {
+      issues.push(mkRecommendation("MEDIUM", "otSDKStub.js is not located in the <head> section."));
+      recommendations.push(
+        mkRecommendation("MEDIUM", "Move otSDKStub.js into <head> as early as possible (before other scripts).")
+      );
+    }
+
+    if (autoBlockEnabled && !autoBlockInHead) {
+      issues.push(mkRecommendation("MEDIUM", "otAutoBlock.js is not located in the <head> section."));
+      recommendations.push(
+        mkRecommendation("MEDIUM", "Move otAutoBlock.js into <head> and ensure it loads before tags it should block.")
+      );
+    }
+
+    if (scriptsBeforeOtSdkStub) {
+      issues.push(mkRecommendation("MEDIUM", "There are scripts before otSDKStub.js in the DOM."));
+      recommendations.push(
+        mkRecommendation("MEDIUM", "Ensure otSDKStub.js loads before other JS to guarantee consent enforcement timing.")
+      );
+    }
+
+    if (scriptsBeforeAutoBlockFlag) {
+      issues.push(mkRecommendation("MEDIUM", "There are scripts before otAutoBlock.js in the DOM."));
+      recommendations.push(
+        mkRecommendation("MEDIUM", "Ensure otAutoBlock.js loads before any scripts you expect it to block.")
+      );
+    }
+
+    if (otSDKStubFound && !capturedConfig && productionUdid) {
+      issues.push(mkRecommendation("LOW", "OneTrust script detected, but UDID config JSON was not captured."));
+      recommendations.push(
+        mkRecommendation("LOW", "Verify the domain script is reachable and not blocked; try extending wait time slightly.")
+      );
+    }
+
+    // Helpful notes mirroring your previous observations
+    if (otSDKStubFound && scriptsBeforeOtSdkStub) {
+      notes.push(
+        `Observation: ${scriptsBeforeOtSDKStub.length} script tag(s) appear before otSDKStub.js in the DOM.`
+      );
+    }
+    if (autoBlockEnabled && scriptsBeforeAutoBlockFlag) {
+      notes.push(
+        `Observation: ${scriptsBeforeAutoBlock.length} script tag(s) appear before otAutoBlock.js in the DOM.`
+      );
+    }
+
+    const severity = computeSeverity(issues);
+
+    // -------- Debug artefacts only when requested --------
     if (DEBUG) {
       await page.screenshot({ path: "debug-screenshot.png", fullPage: true });
       fs.writeFileSync("debug-page.html", await page.content());
@@ -270,76 +409,53 @@ export async function runCheck(targetUrl) {
       fs.writeFileSync("cookie-list.json", JSON.stringify(cookies, null, 2));
     }
 
-// ✅ DUPLICATES
-const hasDuplicateOtSdkStub =
-  stubScripts.length > 1 || otStubNetworkCalls.length > 1;
-
-const hasDuplicateAutoBlock =
-  autoBlockScripts.length > 1 || otAutoBlockNetworkCalls.length > 1;
-
-// ✅ SCRIPT ORDER
-const scriptsBeforeOtSdkStubFlag =
-  scriptsBeforeOtSDKStub.length > 0;
-
-const scriptsBeforeAutoBlockFlag =
-  scriptsBeforeAutoBlock.length > 0;
-
-// ✅ HEAD CHECK
-const otSdkStubInHead =
-  firstStubScript?.inHead ?? false;
-
-const autoBlockInHead =
-  firstAutoBlockScript?.inHead ?? false;
-  
-  const issues = [];
-
-if (hasDuplicateOtSdkStub) {
-  issues.push("Duplicate otSDKStub detected");
-}
-
-if (hasDuplicateAutoBlock) {
-  issues.push("Duplicate otAutoBlock detected");
-}
-
-if (!otSdkStubInHead) {
-  issues.push("otSDKStub.js not in <head>");
-}
-
-if (scriptsBeforeOtSdkStubFlag) {
-  issues.push("Scripts are loading before otSDKStub");
-}
-``
-  
-    // ✅ Return the result instead of console.log + exiting
+    // ✅ Final response (Copilot-friendly + your flags)
     return {
-  TenantGuid: capturedConfig?.TenantGuid ?? "",
-  EnvId: capturedConfig?.EnvId ?? "",
-  Domain: capturedConfig?.Domain ?? "",
+      checkedUrl: targetUrl,
+      checkedAt: new Date().toISOString(),
 
-  primaryUdid,
-  capturedConfigUrl,
+      // IDs you care about
+      TenantGuid: capturedConfig?.TenantGuid ?? "",
+      EnvId: capturedConfig?.EnvId ?? "",
+      Domain: capturedConfig?.Domain ?? "",
 
-  otSDKStubFound: stubScripts.length > 0,
-  autoBlockEnabled: autoBlockScripts.length > 0,
+      primaryUdid,
+      productionUdid,
+      usingTestScript,
+      capturedConfigUrl,
 
-  // ✅ NEW FLAGS
-  hasDuplicateOtSdkStub,
-  hasDuplicateAutoBlock,
+      // ✅ flags you requested
+      otSDKStubFound,
+      autoBlockEnabled,
+      hasDuplicateOtSdkStub,
+      hasDuplicateAutoBlock,
+      scriptsBeforeOtSdkStub,
+      scriptsBeforeAutoBlock: scriptsBeforeAutoBlockFlag,
+      otSdkStubInHead,
+      autoBlockInHead,
 
-  scriptsBeforeOtSdkStub: scriptsBeforeOtSdkStubFlag,
-  scriptsBeforeAutoBlock: scriptsBeforeAutoBlockFlag,
+      // lightweight stats (optional)
+      apiCallCount: apiCalls.length,
 
-  otSdkStubInHead,
-  autoBlockInHead,
+      // high value output
+      severity,
+      issues,
+      recommendations,
 
-  accessDenied,
-  notes
-};
+      // helpful debugging (keep – but not too huge)
+      accessDenied,
+      notes,
 
+      // Optional: keep these if you still want them (Copilot can ignore)
+      // cookies,
+      // oneTrustConsoleChecks,
+      // AutoblockConfig: autoBlockResponseDetails,
+      // geoLocation: geoLocationResponseDetails
+    };
   } finally {
-    // ✅ Always close browser even if errors happen
     if (browser) {
       await browser.close().catch(() => {});
     }
   }
 }
+``
