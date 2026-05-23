@@ -1,7 +1,9 @@
 import { chromium } from "playwright";
 
 function normaliseUrl(url) {
-  const trimmed return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;  const trimmed = (url || "").trim();
+  const trimmed = (url || "").trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 function cleanUdid(udid = "") {
@@ -23,7 +25,6 @@ function computeSeverity(findings) {
   return "NONE";
 }
 
-// ---- Domain helper ----
 function isDomainMatching(host, domain) {
   if (!host || !domain) return false;
   const h = host.toLowerCase();
@@ -36,9 +37,9 @@ export async function runCheck(inputUrl) {
   if (!targetUrl) throw new Error("url is required");
 
   let browser = null;
+  let capturedConfig = null;
 
   const notes = [];
-  let capturedConfig = null;
 
   try {
     browser = await chromium.launch({ headless: true });
@@ -84,7 +85,7 @@ export async function runCheck(inputUrl) {
     const checkedHost = new URL(targetUrl).hostname || "";
     const configDomain = capturedConfig?.Domain ?? "";
 
-    // ✅ BOOLEAN FIX (unchanged logic, safe types)
+    // ✅ BOOLEAN SAFE (no nulls)
     let domainScopeValid = false;
     let domainOutOfScope = false;
 
@@ -102,7 +103,6 @@ export async function runCheck(inputUrl) {
       domainOutOfScope = false;
     }
 
-    // ✅ FINAL SAFE CAST
     domainScopeValid = Boolean(domainScopeValid);
     domainOutOfScope = Boolean(domainOutOfScope);
 
@@ -171,4 +171,3 @@ export async function runCheck(inputUrl) {
     if (browser) await browser.close().catch(() => {});
   }
 }
-  if (!trimmed) return "";
