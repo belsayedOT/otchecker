@@ -270,40 +270,72 @@ export async function runCheck(targetUrl) {
       fs.writeFileSync("cookie-list.json", JSON.stringify(cookies, null, 2));
     }
 
+// ✅ DUPLICATES
+const hasDuplicateOtSdkStub =
+  stubScripts.length > 1 || otStubNetworkCalls.length > 1;
+
+const hasDuplicateAutoBlock =
+  autoBlockScripts.length > 1 || otAutoBlockNetworkCalls.length > 1;
+
+// ✅ SCRIPT ORDER
+const scriptsBeforeOtSdkStubFlag =
+  scriptsBeforeOtSDKStub.length > 0;
+
+const scriptsBeforeAutoBlockFlag =
+  scriptsBeforeAutoBlock.length > 0;
+
+// ✅ HEAD CHECK
+const otSdkStubInHead =
+  firstStubScript?.inHead ?? false;
+
+const autoBlockInHead =
+  firstAutoBlockScript?.inHead ?? false;
+  
+  const issues = [];
+
+if (hasDuplicateOtSdkStub) {
+  issues.push("Duplicate otSDKStub detected");
+}
+
+if (hasDuplicateAutoBlock) {
+  issues.push("Duplicate otAutoBlock detected");
+}
+
+if (!otSdkStubInHead) {
+  issues.push("otSDKStub.js not in <head>");
+}
+
+if (scriptsBeforeOtSdkStubFlag) {
+  issues.push("Scripts are loading before otSDKStub");
+}
+``
+  
     // ✅ Return the result instead of console.log + exiting
     return {
-      checkedUrl: normaliseUrl(targetUrl),
-      checkedAt: new Date().toISOString(),
-      accessDenied,
+  TenantGuid: capturedConfig?.TenantGuid ?? "",
+  EnvId: capturedConfig?.EnvId ?? "",
+  Domain: capturedConfig?.Domain ?? "",
 
-      capturedConfigUrl,
+  primaryUdid,
+  capturedConfigUrl,
 
-      TenantGuid: capturedConfig?.TenantGuid ?? "",
-      EnvId: capturedConfig?.EnvId ?? "",
-      Domain: capturedConfig?.Domain ?? "",
+  otSDKStubFound: stubScripts.length > 0,
+  autoBlockEnabled: autoBlockScripts.length > 0,
 
-      otSDKStub: {
-        found: stubScripts.length > 0 || otStubNetworkCalls.length > 0,
-        domCount: stubScripts.length,
-        networkCount: otStubNetworkCalls.length,
-        dataDomainScriptValues,
-        primaryUdid,
-        productionUdid,
-        usingTestScript
-      },
+  // ✅ NEW FLAGS
+  hasDuplicateOtSdkStub,
+  hasDuplicateAutoBlock,
 
-      autoBlock: {
-        enabled: autoBlockScripts.length > 0 || otAutoBlockNetworkCalls.length > 0
-      },
+  scriptsBeforeOtSdkStub: scriptsBeforeOtSdkStubFlag,
+  scriptsBeforeAutoBlock: scriptsBeforeAutoBlockFlag,
 
-      AutoblockConfig: autoBlockResponseDetails,
-      geoLocation: geoLocationResponseDetails,
+  otSdkStubInHead,
+  autoBlockInHead,
 
-      cookies,
-      oneTrustConsoleChecks,
-      apiCalls,
-      notes
-    };
+  accessDenied,
+  notes
+};
+
   } finally {
     // ✅ Always close browser even if errors happen
     if (browser) {
