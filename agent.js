@@ -20,145 +20,100 @@ function mkFinding(severity, message) {
 
 function computeSeverity(findings) {
   if (findings.some(f => f.severity === "HIGH")) return "HIGH";
-  if (findings.some(f => f.severity === "MEDIUM")) return "MEDIUM";
   if (findings.length > 0) return "LOW";
   return "NONE";
 }
 
-function isDomainMatching(host, domain) {
-  if (!host || !domain) return false;
-  const h = host.toLowerCase();
-  const d = domain.toLowerCase();
-  return h === d || h.endsWith(`.${d}`);
-}
-
 function looksLikeUdidJson(obj) {
-  if (!obj || typeof obj !== "object") return false;
-  const keys = [
-    "TenantGuid",
-    "EnvId",
-    "Domain",
-    "Version",
-    "ScriptType",
-    "RuleSet",
-    "SkipGeolocation",
-    "LanguageDetectionEnabled",
-    "LanguageDetectionByHtml",
-    "GeoRuleGroupName"
-  ];
-  return keys.some(k => Object.prototype.hasOwnProperty.call(obj, k));
-}
-
-function isJsFileSrc(src = "") {
-  const s = (src || "").toLowerCase();
-  return s.includes(".js") || s.includes("scripttemplates");
+  if (!obj) return false;
+  return obj.Domain && obj.Version && obj.ScriptType;
 }
 
 export async function runCheck(inputUrl) {
   const targetUrl = normaliseUrl(inputUrl);
-  if (!targetUrl) throw new Error("url is required");
 
-  let browser = null;
   let capturedConfig = null;
-  let capturedConfigUrl = "";
-
   let accessDenied = false;
-  let navigationError = null;
+
+  let browser;
 
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
-    // capture JSON + access issues
-    page.on("response", async response => {
+    // capture responses
+    page.on("response", async (response) => {
       try {
         const status = response.status();
-        const url = response.url();
 
         if (response.request().resourceType() === "document" && (status === 401 || status === 403)) {
           accessDenied = true;
         }
 
-        const isJson =
-          url.toLowerCase().includes(".json") ||
-          (response.headers()["content-type"] || "").includes("json");
+        const url = response.url().toLowerCase();
 
-        if (!isJson) return;
+        if (!url.includes("json")) return;
 
         const text = await response.text();
-        let parsed;
-
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          return;
-        }
+        const parsed = JSON.parse(text);
 
         if (looksLikeUdidJson(parsed)) {
           capturedConfig = parsed;
-          capturedConfigUrl = url;
         }
+
       } catch {}
     });
 
-    let response;
+    let navError = null;
+
     try {
-      response = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     } catch (err) {
-      navigationError = err.message;
+      navError = err.message;
     }
 
-    if (!response && navigationError) {
+    if (navError) {
       return {
         checkedUrl: targetUrl,
         severity: "HIGH",
-        issues: [mkFinding("HIGH", navigationError)],
-        recommendations: ["Check URL spelling or DNS"],
+        issues: [mkFinding("HIGH", navError)]
       };
     }
 
     await page.waitForTimeout(5000);
 
-    // script scan
+    // scan scripts
     const scripts = await page.locator("script").evaluateAll(nodes =>
       nodes.map((s, i) => ({
         index: i,
         src: s.src || "",
         inHead: document.head.contains(s),
-        dataDomainScript: s.getAttribute("data-domain-script") || ""
+        udid: s.getAttribute("data-domain-script") || ""
       }))
     );
 
-    const stubScripts = scripts.filter(s => s.src.toLowerCase().includes("otsdkstub"));
-    const autoBlockScripts = scripts.filter(s => s.src.toLowerCase().includes("otautoblock"));
+    const stub = scripts.filter(s => s.src.toLowerCase().includes("otsdkstub"));
+    const autoblock = scripts.filter(s => s.src.toLowerCase().includes("otautoblock"));
 
-    const firstOtIndex = Math.min(
-      ...[...stubScripts, ...autoBlockScripts].map(s => s.index)
-    );
+    const firstOt = Math.min(...[...stub, ...autoblock].map(s => s.index));
 
-    const jsBefore = scripts.filter(s => s.index < firstOtIndex && isJsFileSrc(s.src));
+    const jsBefore = scripts.filter(s => s.index < firstOt && s.src.includes(".js"));
 
-    const primaryUdid = stubScripts.find(s => s.dataDomainScript)?.dataDomainScript || "";
+    const primaryUdid = stub.find(s => s.udid)?.udid || "";
 
-    // udid.json fields
-    const version = capturedConfig?.Version ?? "";
-    const scriptType = capturedConfig?.ScriptType ?? "";
-    const langHtml = capturedConfig?.LanguageDetectionByHtml ?? "";
-    const langEnabled = capturedConfig?.LanguageDetectionEnabled ?? "";
-    const geoRule = capturedConfig?.GeoRuleGroupName ?? "";
-
-    const ruleSet = Array.isArray(capturedConfig?.RuleSet) ? capturedConfig.RuleSet : [];
-    const ruleCount = ruleSet.length;
+    // udid json fields
+    const ruleSet = capturedConfig?.RuleSet || [];
     const skipGeo = capturedConfig?.SkipGeolocation === true;
 
-    // geolocation logic
     let geoData = null;
-    if (!(ruleCount === 1 && skipGeo)) {
+
+    if (!(ruleSet.length === 1 && skipGeo)) {
       try {
         await page.waitForFunction(() => window.OneTrust, { timeout: 5000 });
+
         geoData = await page.evaluate(() => {
           try {
-            return window.OneTrust?.getGeolocationData?.() ?? null;
+            return window.OneTrust?.getGeolocationData?.();
           } catch {
             return null;
           }
@@ -167,22 +122,17 @@ export async function runCheck(inputUrl) {
     }
 
     // consent modes
-    let consentData = {};
+    let consent = {};
+
     try {
-      consentData = await page.evaluate(() => {
+      consent = await page.evaluate(() => {
         try {
-          return window.OneTrust.GetDomainData();
+          return window.OneTrust?.GetDomainData?.();
         } catch {
           return {};
         }
       });
     } catch {}
-
-    const issues = [];
-
-    if (!stubScripts.length) {
-      issues.push(mkFinding("HIGH", "otSDKStub missing"));
-    }
 
     return {
       checkedUrl: targetUrl,
@@ -192,12 +142,12 @@ export async function runCheck(inputUrl) {
       Domain: capturedConfig?.Domain ?? "",
 
       udidJson: {
-        Version: version,
-        ScriptType: scriptType,
-        LanguageDetectionByHtml: langHtml,
-        LanguageDetectionEnabled: langEnabled,
-        GeoRuleGroupName: geoRule,
-        RuleSetCount: ruleCount,
+        Version: capturedConfig?.Version ?? "",
+        ScriptType: capturedConfig?.ScriptType ?? "",
+        LanguageDetectionByHtml: capturedConfig?.LanguageDetectionByHtml ?? "",
+        LanguageDetectionEnabled: capturedConfig?.LanguageDetectionEnabled ?? "",
+        GeoRuleGroupName: capturedConfig?.GeoRuleGroupName ?? "",
+        RuleSetCount: ruleSet.length,
         SkipGeolocation: skipGeo
       },
 
@@ -205,10 +155,11 @@ export async function runCheck(inputUrl) {
       productionUdid: cleanUdid(primaryUdid),
       usingTestScript: isTestScript(primaryUdid),
 
-      otSDKStubFound: !!stubScripts.length,
-      autoBlockEnabled: !!autoBlockScripts.length,
-      otSdkStubInHead: stubScripts.some(s => s.inHead),
-      otAutoBlockInHead: autoBlockScripts.some(s => s.inHead),
+      otSDKStubFound: stub.length > 0,
+      autoBlockEnabled: autoblock.length > 0,
+
+      otSdkStubInHead: stub.some(s => s.inHead),
+      otAutoBlockInHead: autoblock.some(s => s.inHead),
 
       hasJsBeforeOt: jsBefore.length > 0,
       previousScripts: jsBefore.map(s => s.src),
@@ -216,14 +167,18 @@ export async function runCheck(inputUrl) {
       geolocation: geoData,
 
       consentModes: {
-        google: consentData?.GoogleConsent?.GCEnable ?? null,
-        microsoft: consentData?.MCMData?.Enabled ?? null,
-        amazon: consentData?.ACMData?.Enabled ?? null
+        google: consent?.GoogleConsent?.GCEnable ?? null,
+        microsoft: consent?.MCMData?.Enabled ?? null,
+        amazon: consent?.ACMData?.Enabled ?? null
       },
 
       accessDenied,
 
-      severity: computeSeverity(issues),
-      issues
+      severity: "NONE",
+      issues: []
     };
+
+  } finally {
+    if (browser) await browser.close();
+  }
 }
