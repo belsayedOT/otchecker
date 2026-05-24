@@ -1,4 +1,3 @@
-	CAUTION: This email originated from outside OneTrust. Do not click links or open attachments unless you recognize the sender and know the content is safe. 
 import { chromium } from "playwright";
 
 function normaliseUrl(url) {
