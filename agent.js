@@ -51,6 +51,9 @@ function normaliseConsentModel(consentModel) {
   return String(consentModel);
 }
 
+const EXPECTED_WORKFLOW_VERSION_REGEX = /\b(?:202[3-9]|20[3-9]\d)(?:0[1-9]|1[0-2])\.[12]\.0\b/;
+const LATEST_AVAILABLE_WORKFLOW_VERSION = "2026.05.0";
+
 function toArray(value) {
   if (!value) return [];
 
@@ -633,6 +636,40 @@ export async function runCheck(inputUrl, options = {}) {
 
     const finalUrl = page.url();
 
+    const udidIdValue = String(capturedUdidJson?.Id ?? capturedUdidJson?.id ?? "").trim();
+    const udidDomainValue = String(capturedUdidJson?.Domain ?? capturedUdidJson?.domain ?? "").trim();
+    const isTestUdidScript = udidIdValue.toLowerCase().endsWith("-test");
+
+    const pageHost = (() => {
+      try {
+        return new URL(finalUrl).hostname.toLowerCase();
+      } catch {
+        return "";
+      }
+    })();
+
+    const normalizedUdidDomain = udidDomainValue.replace(/^\*\./, "").toLowerCase();
+    let udidScriptScopeValid = false;
+    let udidScriptScopeMessage = "";
+
+    if (isTestUdidScript) {
+      udidScriptScopeValid = false;
+      udidScriptScopeMessage =
+        "UDID id indicates a test script is used instead of production.";
+    } else if (!normalizedUdidDomain) {
+      udidScriptScopeValid = false;
+      udidScriptScopeMessage =
+        "No UDID domain value is available to determine script scope.";
+    } else {
+      udidScriptScopeValid =
+        pageHost === normalizedUdidDomain ||
+        pageHost.endsWith(`.${normalizedUdidDomain}`);
+
+      udidScriptScopeMessage = udidScriptScopeValid
+        ? `Production script domain scope ${udidDomainValue} covers page host ${pageHost}.`
+        : `Production script domain scope ${udidDomainValue} does not cover page host ${pageHost}. This script is invalid on this page and may not be able to save consent across page refreshes.`;
+    }
+
     const cookies = await context.cookies();
     const optanonConsentCookie = getCookieByName(cookies, "OptanonConsent");
     const optanonActiveGroupsCookie = getCookieByName(
@@ -699,6 +736,8 @@ export async function runCheck(inputUrl, options = {}) {
 
     const cookieAudit = {
       optanonConsentExists: Boolean(optanonConsentCookie),
+      optanonConsentSameSite: optanonConsentCookie?.sameSite ?? "",
+      optanonConsentSecure: Boolean(optanonConsentCookie?.secure),
       optanonActiveGroupsExists: Boolean(optanonActiveGroupsCookie),
       optanonAlertBoxClosedExists: Boolean(optanonAlertBoxClosedCookie),
       optanonCookieNames,
@@ -711,6 +750,22 @@ export async function runCheck(inputUrl, options = {}) {
     const skipGeolocation = capturedUdidJson?.SkipGeolocation === true;
     const ruleSetCount = ruleSet.length;
     const ruleSetSummary = summariseRuleSet(ruleSet);
+
+    const versionValue = capturedUdidJson?.Version ?? "";
+    const versionMatches = EXPECTED_WORKFLOW_VERSION_REGEX.test(versionValue);
+    const versionCheck = {
+      version: versionValue,
+      isVersionSupported: versionMatches,
+      latestAvailableVersion: LATEST_AVAILABLE_WORKFLOW_VERSION,
+      status: versionValue
+        ? versionMatches
+          ? "SUPPORTED"
+          : "OUT_OF_DATE"
+        : "UNKNOWN",
+      warning: versionValue && !versionMatches
+        ? "High level warning: the banner is out of date and using an old workflow version. Recommend upgrading the banner to the latest available version."
+        : "",
+    };
 
     const shouldSkipLocationInfo =
       ruleSetCount === 1 && skipGeolocation === true;
@@ -946,6 +1001,17 @@ export async function runCheck(inputUrl, options = {}) {
         LanguageDetectionEnabled:
           capturedUdidJson?.LanguageDetectionEnabled ?? "",
         GeoRuleGroupName: capturedUdidJson?.GeoRuleGroupName ?? "",
+        CDNLocation: capturedUdidJson?.CDNLocation ?? "",
+        EnvId: capturedUdidJson?.EnvId ?? "",
+        Domain: udidDomainValue,
+        Id: udidIdValue,
+        isTestScript: isTestUdidScript,
+        scriptScopeValid: udidScriptScopeValid,
+        scriptScopeMessage: udidScriptScopeMessage,
+        CookieSPAEnabled:
+          capturedUdidJson?.CookieSPAEnabled === true,
+        CookieSameSiteNoneEnabled:
+          capturedUdidJson?.CookieSameSiteNoneEnabled === true,
         RuleSetCount: ruleSetCount,
         SkipGeolocation: skipGeolocation,
       },
@@ -985,6 +1051,8 @@ export async function runCheck(inputUrl, options = {}) {
         getGeolocationDataAvailable: oneTrustApiState.getGeolocationDataAvailable,
         dataLayerEventCount: gtagAndDataLayerState.dataLayer.length,
       },
+
+      versionCheck,
 
       ruleSetSummary,
 
