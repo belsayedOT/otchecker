@@ -668,7 +668,22 @@ export async function runCheck(inputUrl, options = {}) {
     const finalUrl = page.url();
 
     const udidIdValue = String(capturedUdidJson?.Id ?? capturedUdidJson?.id ?? "").trim();
+    const udidTenantGuidValue = String(
+      capturedUdidJson?.TenantGuid ??
+      capturedUdidJson?.tenantGuid ??
+      ""
+    ).trim();
     const udidDomainValue = String(capturedUdidJson?.Domain ?? capturedUdidJson?.domain ?? "").trim();
+    const udidFileNameValue = (() => {
+      try {
+        const url = new URL(capturedUdidJsonUrl);
+        const filename = url.pathname.split("/").pop() || "";
+        const match = filename.match(/^(.+?)\.json$/i);
+        return match ? match[1] : "";
+      } catch {
+        return "";
+      }
+    })();
     const isTestUdidScript = udidIdValue.toLowerCase().endsWith("-test");
 
     const pageHost = (() => {
@@ -1093,6 +1108,8 @@ export async function runCheck(inputUrl, options = {}) {
         EnvId: capturedUdidJson?.EnvId ?? "",
         Domain: udidDomainValue,
         Id: udidIdValue,
+        TenantGuid: udidTenantGuidValue,
+        UdidFileNameValue: udidFileNameValue,
         isTestScript: isTestUdidScript,
         scriptScopeValid: udidScriptScopeValid,
         scriptScopeMessage: udidScriptScopeMessage,
