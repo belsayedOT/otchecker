@@ -1,9 +1,10 @@
 import { chromium } from "playwright";
 
 function normaliseUrl(url) {
-  const trimmed(trimmed) ? trimmed : `https://${trimmed}`;  const trimmed = (url || "").trim();
+  const trimmed = (url || "").trim();
+  if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
-
 function cleanUdid(udid = "") {
   return udid.toLowerCase().endsWith("-test") ? udid.slice(0, -5) : udid;
 }
