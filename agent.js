@@ -237,4 +237,241 @@ export async function runCheck(inputUrl, options = {}) {
 
     if (navigationError) {
       return {
-        checkedUrl: targetUrl
+        checkedUrl: targetUrl,
+        success: false,
+        accessDenied,
+        error: navigationError,
+      };
+    }
+
+    await page.waitForTimeout(pageLoadWaitMs);
+
+    const finalUrl = page.url();
+
+    const scripts = await page.locator("script").evaluateAll((nodes) =>
+      nodes.map((script, index) => ({
+        index,
+        src: script.src || "",
+        inHead: document.head.contains(script),
+        dataDomainScript: script.getAttribute("data-domain-script") || "",
+      }))
+    );
+
+    const otSdkStubScripts = scripts.filter((script) =>
+      script.src.toLowerCase().includes("otsdkstub")
+    );
+
+    const otAutoBlockScripts = scripts.filter((script) =>
+      script.src.toLowerCase().includes("otautoblock")
+    );
+
+    const oneTrustScripts = [
+      ...otSdkStubScripts,
+      ...otAutoBlockScripts,
+    ];
+
+    const firstOneTrustScriptIndex =
+      oneTrustScripts.length > 0
+        ? Math.min(...oneTrustScripts.map((script) => script.index))
+        : null;
+
+    const jsScriptsBeforeOneTrust =
+      firstOneTrustScriptIndex === null
+        ? []
+        : scripts.filter((script) => {
+            const src = script.src.toLowerCase();
+
+            return (
+              script.index < firstOneTrustScriptIndex &&
+              src &&
+              src.includes(".js")
+            );
+          });
+
+    const otSdkStubInHead = otSdkStubScripts.some((script) => script.inHead);
+    const otAutoBlockInHead = otAutoBlockScripts.some((script) => script.inHead);
+
+    const ruleSet = Array.isArray(capturedUdidJson?.RuleSet)
+      ? capturedUdidJson.RuleSet
+      : [];
+
+    const skipGeolocation = capturedUdidJson?.SkipGeolocation === true;
+    const ruleSetCount = ruleSet.length;
+
+    const shouldSkipLocationInfo =
+      ruleSetCount === 1 && skipGeolocation === true;
+
+    let geolocationData = null;
+    let detectedCountry = "";
+    let detectedState = "";
+    let matchedRuleSet = {
+      matched: false,
+      matchReason: "",
+      matchedRuleIndex: null,
+      templateName: "",
+    };
+
+    if (shouldSkipLocationInfo) {
+      matchedRuleSet = {
+        matched: true,
+        matchReason:
+          "SkipGeolocation is true and RuleSet has only one item, so RuleSet[0] was used.",
+        matchedRuleIndex: 0,
+        templateName: getRuleTemplateName(ruleSet[0]),
+      };
+    } else if (skipGeolocation === false) {
+      try {
+        await page.waitForFunction(
+          () =>
+            window.OneTrust &&
+            typeof window.OneTrust.getGeolocationData === "function",
+          { timeout: oneTrustTimeoutMs }
+        );
+
+        geolocationData = await page.evaluate(() => {
+          try {
+            return window.OneTrust.getGeolocationData();
+          } catch {
+            return null;
+          }
+        });
+
+        detectedCountry =
+          geolocationData?.country ||
+          geolocationData?.Country ||
+          geolocationData?.countryCode ||
+          geolocationData?.CountryCode ||
+          "";
+
+        detectedState =
+          geolocationData?.state ||
+          geolocationData?.State ||
+          geolocationData?.stateCode ||
+          geolocationData?.StateCode ||
+          geolocationData?.region ||
+          geolocationData?.Region ||
+          "";
+
+        matchedRuleSet = findMatchingRuleSet(ruleSet, geolocationData);
+      } catch {
+        geolocationData = null;
+        matchedRuleSet = {
+          matched: false,
+          matchReason:
+            "SkipGeolocation is false, but OneTrust.getGeolocationData() was not available or did not return data.",
+          matchedRuleIndex: null,
+          templateName: "",
+        };
+      }
+    }
+
+    let googleConsentModeEnabled = null;
+    let microsoftConsentModeEnabled = null;
+    let amazonConsentModeEnabled = null;
+
+    try {
+      await page.waitForFunction(
+        () =>
+          window.OneTrust &&
+          typeof window.OneTrust.GetDomainData === "function",
+        { timeout: oneTrustTimeoutMs }
+      );
+
+      const consentModes = await page.evaluate(() => {
+        try {
+          const data = window.OneTrust.GetDomainData();
+
+          return {
+            google: data?.GoogleConsent?.GCEnable ?? null,
+            microsoft: data?.MCMData?.Enabled ?? null,
+            amazon: data?.ACMData?.Enabled ?? null,
+          };
+        } catch {
+          return {
+            google: null,
+            microsoft: null,
+            amazon: null,
+          };
+        }
+      });
+
+      googleConsentModeEnabled = consentModes.google;
+      microsoftConsentModeEnabled = consentModes.microsoft;
+      amazonConsentModeEnabled = consentModes.amazon;
+    } catch {
+      googleConsentModeEnabled = null;
+      microsoftConsentModeEnabled = null;
+      amazonConsentModeEnabled = null;
+    }
+
+    return {
+      checkedUrl: targetUrl,
+      finalUrl,
+      success: true,
+      accessDenied,
+
+      udidJsonFound: Boolean(capturedUdidJson),
+      udidJsonUrl: capturedUdidJsonUrl,
+
+      udidJson: {
+        Version: capturedUdidJson?.Version ?? "",
+        ScriptType: capturedUdidJson?.ScriptType ?? "",
+        LanguageDetectionByHtml:
+          capturedUdidJson?.LanguageDetectionByHtml ?? "",
+        LanguageDetectionEnabled:
+          capturedUdidJson?.LanguageDetectionEnabled ?? "",
+        GeoRuleGroupName: capturedUdidJson?.GeoRuleGroupName ?? "",
+        RuleSetCount: ruleSetCount,
+        SkipGeolocation: skipGeolocation,
+      },
+
+      scriptPlacement: {
+        otSdkStubFound: otSdkStubScripts.length > 0,
+        otAutoBlockFound: otAutoBlockScripts.length > 0,
+
+        otSdkStubInHead,
+        otAutoBlockInHead,
+
+        oneTrustScriptInHead:
+          otSdkStubInHead || otAutoBlockInHead,
+
+        jsFilesBeforeOneTrust:
+          jsScriptsBeforeOneTrust.length > 0,
+
+        jsFilesBeforeOneTrustCount:
+          jsScriptsBeforeOneTrust.length,
+
+        jsFilesBeforeOneTrustList:
+          jsScriptsBeforeOneTrust.map((script) => script.src),
+      },
+
+      geolocation: {
+        skipped: shouldSkipLocationInfo,
+        reason: shouldSkipLocationInfo
+          ? "RuleSet has one item and SkipGeolocation is true."
+          : "SkipGeolocation is false, so OneTrust.getGeolocationData() was checked.",
+        data: shouldSkipLocationInfo ? null : geolocationData,
+        country: shouldSkipLocationInfo ? "" : detectedCountry,
+        state: shouldSkipLocationInfo ? "" : detectedState,
+      },
+
+      selectedRuleSet: {
+        matched: matchedRuleSet.matched,
+        matchReason: matchedRuleSet.matchReason,
+        matchedRuleIndex: matchedRuleSet.matchedRuleIndex,
+        templateName: matchedRuleSet.templateName,
+      },
+
+      consentModes: {
+        googleConsentModeEnabled,
+        microsoftConsentModeEnabled,
+        amazonConsentModeEnabled,
+      },
+    };
+  } finally {
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+export default runCheck;
