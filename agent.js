@@ -782,9 +782,9 @@ export async function runCheck(inputUrl, options = {}) {
 
     const triggerRuleSet = summariseTriggeredRuleSet(triggerRuleMatch);
 
-    let googleConsentModeEnabled = null;
-    let microsoftConsentModeEnabled = null;
-    let amazonConsentModeEnabled = null;
+    let googleConsentModeEnabled = false;
+    let microsoftConsentModeEnabled = false;
+    let amazonConsentModeEnabled = false;
     let consentModel = "";
     let enabledSdkDetails = {};
 
@@ -857,9 +857,9 @@ export async function runCheck(inputUrl, options = {}) {
       });
 
       consentModel = normaliseConsentModel(consentModeData.consentModel);
-      googleConsentModeEnabled = consentModeData.googleEnabled;
-      microsoftConsentModeEnabled = consentModeData.microsoftEnabled;
-      amazonConsentModeEnabled = consentModeData.amazonEnabled;
+      googleConsentModeEnabled = consentModeData.googleEnabled === true;
+      microsoftConsentModeEnabled = consentModeData.microsoftEnabled === true;
+      amazonConsentModeEnabled = consentModeData.amazonEnabled === true;
 
       if (consentModeData.GoogleConsent) {
         enabledSdkDetails.GoogleConsent = consentModeData.GoogleConsent;
@@ -873,9 +873,9 @@ export async function runCheck(inputUrl, options = {}) {
         enabledSdkDetails.ACMData = consentModeData.ACMData;
       }
     } catch {
-      googleConsentModeEnabled = null;
-      microsoftConsentModeEnabled = null;
-      amazonConsentModeEnabled = null;
+      googleConsentModeEnabled = false;
+      microsoftConsentModeEnabled = false;
+      amazonConsentModeEnabled = false;
       consentModel = "";
       enabledSdkDetails = {};
     }
