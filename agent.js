@@ -1,9 +1,7 @@
 import { chromium } from "playwright";
 
 function normaliseUrl(url) {
-  const trimmed = (url || "").trim();
-  if (!trimmed) return "";
-  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  const trimmed(trimmed) ? trimmed : `https://${trimmed}`;  const trimmed = (url || "").trim();
 }
 
 function cleanUdid(udid = "") {
@@ -42,10 +40,27 @@ export async function runCheck(inputUrl) {
   const notes = [];
   let capturedConfig = null;
 
+  let isCspBlocked = false;
+  let accessDenied = false;
+
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
+    // ---- detect HTTP access issues ----
+    page.on("response", response => {
+      try {
+        const status = response.status();
+
+        if (response.request().resourceType() === "document") {
+          if (status === 401 || status === 403) {
+            accessDenied = true;
+          }
+        }
+      } catch {}
+    });
+
+    // ---- capture config JSON ----
     page.on("response", async response => {
       try {
         const url = response.url().toLowerCase();
@@ -59,9 +74,37 @@ export async function runCheck(inputUrl) {
       } catch {}
     });
 
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+    // ---- navigate ----
+    const navigationResponse = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
+
+    if (navigationResponse) {
+      const status = navigationResponse.status();
+      if (status === 401 || status === 403) {
+        accessDenied = true;
+      }
+    }
+
     await page.waitForTimeout(5000);
 
+    // ---- detect access denied from page content ----
+    try {
+      const bodyText = await page.evaluate(() => document.body?.innerText || "");
+      const lowered = bodyText.toLowerCase();
+
+      if (
+        lowered.includes("access denied") ||
+        lowered.includes("403 forbidden") ||
+        lowered.includes("request blocked") ||
+        lowered.includes("you don't have permission") ||
+        lowered.includes("forbidden") ||
+        lowered.includes("not authorised") ||
+        lowered.includes("not authorized")
+      ) {
+        accessDenied = true;
+      }
+    } catch {}
+
+    // ---- script extraction ----
     const scripts = await page.locator("script").evaluateAll(nodes =>
       nodes.map(s => ({
         src: s.src || "",
@@ -92,12 +135,10 @@ export async function runCheck(inputUrl) {
     if (usingTestScript) {
       domainScopeValid = true;
       domainOutOfScope = false;
-
     } else if (configDomain && checkedHost) {
       const match = isDomainMatching(checkedHost, configDomain);
       domainScopeValid = Boolean(match);
       domainOutOfScope = Boolean(!match);
-
     } else {
       domainScopeValid = false;
       domainOutOfScope = false;
@@ -112,11 +153,12 @@ export async function runCheck(inputUrl) {
     const hasDuplicateOtSdkStub = stubScripts.length > 1;
     const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
 
-    const isCspBlocked = false;
-    const accessDenied = false;
-
     const issues = [];
     const recommendations = [];
+
+    if (accessDenied) {
+      issues.push(mkFinding("HIGH", "Access denied or blocked (401/403 or page content detected)"));
+    }
 
     if (domainOutOfScope) {
       issues.push(
@@ -171,3 +213,4 @@ export async function runCheck(inputUrl) {
     if (browser) await browser.close().catch(() => {});
   }
 }
+  if (!trimmed) return "";
