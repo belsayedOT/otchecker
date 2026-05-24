@@ -1,6 +1,9 @@
 import { chromium } from "playwright";
 
-/* ---------------- /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;/* -------------------------
+/  if (findings.some(f => f.severity === "HIGH")) return "HIGH";/* ========= Utilities ========= */
+  if (findings.some(f => f.severity === "MEDIUM")) return "MEDIUM";
+  if (findings.length > 0) return "LOW";
+  return "NONE";
 }
 
 function cleanUdid(udid = "") {
@@ -9,17 +12,6 @@ function cleanUdid(udid = "") {
 
 function isTestScript(udid = "") {
   return udid.toLowerCase().endsWith("-test");
-}
-
-function mkFinding(severity, message) {
-  return { severity, message };
-}
-
-function computeSeverity(findings) {
-  if (findings.some(f => f.severity === "HIGH")) return "HIGH";
-  if (findings.some(f => f.severity === "MEDIUM")) return "MEDIUM";
-  if (findings.length > 0) return "LOW";
-  return "NONE";
 }
 
 function isDomainMatching(host, domain) {
@@ -31,24 +23,16 @@ function isDomainMatching(host, domain) {
 
 function looksLikeUdidJson(obj) {
   if (!obj || typeof obj !== "object") return false;
-  const keys = [
-    "TenantGuid",
-    "EnvId",
-    "Domain",
-    "Version",
-    "ScriptType",
-    "RuleSet",
-    "SkipGeolocation",
-    "LanguageDetectionEnabled",
-    "LanguageDetectionByHtml",
-    "GeoRuleGroupName"
-  ];
-  return keys.some(k => Object.prototype.hasOwnProperty.call(obj, k));
+  // keep it loose but reliable: must have RuleSet and either Domain or TenantGuid/EnvId
+  const hasRuleSet = Array.isArray(obj.RuleSet);
+  const hasIdentity = !!(obj.Domain || obj.TenantGuid || obj.EnvId);
+  return hasRuleSet && hasIdentity;
 }
 
 function toList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+
   if (typeof value === "string") {
     return value
       .split(/[\s,;]+/g)
@@ -62,22 +46,17 @@ function lowerList(value) {
   return toList(value).map(v => v.toLowerCase());
 }
 
-/**
- * Your RuleSet → Template resolution rules:
- * - match RuleSet[x].Countries to geolocation country
- * - if RuleSet[x].States is empty => wildcard (country-only match)
- * - if RuleSet[x].States has values => must match state
- * - prefer exact state match over wildcard state match
- */
+/* ========= RuleSet → Template resolution (your logic) ========= */
+
 function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
   const country = (geoCountry || "").toLowerCase().trim();
   const state = (geoState || "").toLowerCase().trim();
 
   if (!Array.isArray(ruleSet) || ruleSet.length === 0) {
-    return { templateName: "", matchType: "no_rules", matchedIndex: -1, matchedRule: null };
+    return { templateName: "", matchType: "no_rules", matchedIndex: -1 };
   }
   if (!country) {
-    return { templateName: "", matchType: "no_geo_country", matchedIndex: -1, matchedRule: null };
+    return { templateName: "", matchType: "no_geo_country", matchedIndex: -1 };
   }
 
   let best = null;
@@ -92,39 +71,33 @@ function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
 
     const hasStateList = states.length > 0;
     const exactStateMatch = hasStateList && state && states.includes(state);
-    const wildcardState = !hasStateList;
+    const wildcardState = !hasStateList; // empty states => wildcard
 
-    // If rule expects states but geo state is empty -> cannot match
+    // If rule expects a state list but geo state is missing, skip it
     if (hasStateList && !state) continue;
 
-    // If state present but does not match -> cannot match
+    // If rule expects a state list but doesn't match geo state, skip it
     if (hasStateList && state && !exactStateMatch) continue;
 
+    // Score: prefer exact state match over wildcard
     const score = exactStateMatch ? 3 : 2;
 
     const candidate = {
-      matchedIndex: i,
-      matchedRule: r,
       templateName: r.TemplateName ?? "",
       matchType: exactStateMatch
         ? "country_and_state"
         : (wildcardState ? "country_and_wildcard_state" : "country_only"),
+      matchedIndex: i,
       score
     };
 
     if (!best || candidate.score > best.score) best = candidate;
   }
 
-  if (!best) {
-    return { templateName: "", matchType: "no_match", matchedIndex: -1, matchedRule: null };
-  }
-
-  return best;
+  return best || { templateName: "", matchType: "no_match", matchedIndex: -1 };
 }
 
-/* -------------------------
-   Main (ESM export)
--------------------------- */
+/* ========= Main ========= */
 
 export async function runCheck(inputUrl) {
   const targetUrl = normaliseUrl(inputUrl);
@@ -132,20 +105,23 @@ export async function runCheck(inputUrl) {
 
   let browser = null;
 
-  const notes = [];
+  // captures
   let capturedConfig = null;
   let capturedConfigUrl = "";
 
+  // flags
   let accessDenied = false;
   let navigationError = null;
-  let isCspBlocked = false; // reserved
+  const isCspBlocked = false; // reserved
+
+  const notes = [];
 
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
-    // Access denied detection via HTTP status
-    page.on("response", async response => {
+    // Track access denied by document response code
+    page.on("response", response => {
       try {
         const status = response.status();
         if (response.request().resourceType() === "document" && (status === 401 || status === 403)) {
@@ -154,7 +130,7 @@ export async function runCheck(inputUrl) {
       } catch {}
     });
 
-    // Capture udid.json-like response
+    // Capture udid.json / config JSON
     page.on("response", async response => {
       try {
         const url = response.url();
@@ -185,7 +161,7 @@ export async function runCheck(inputUrl) {
       } catch {}
     });
 
-    // Navigate safely
+    // Navigate (graceful)
     let navigationResponse = null;
     try {
       navigationResponse = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
@@ -197,20 +173,21 @@ export async function runCheck(inputUrl) {
       return {
         checkedUrl: targetUrl,
         navigationError,
-        accessDenied: false,
         severity: "HIGH",
         issues: [mkFinding("HIGH", `Navigation failed: ${navigationError}`)],
         recommendations: [
           "Verify URL spelling (e.g., www vs wwww)",
-          "Check DNS/network access from runner"
+          "Check DNS/network reachability from the runner"
         ],
         notes
       };
     }
 
-    // extra accessDenied detection from page body text
+    // Wait for resources
+    await page.waitForTimeout(5000);
+
+    // Access denied keyword detection (optional)
     try {
-      await page.waitForTimeout(3000);
       const bodyText = await page.evaluate(() => document.body?.innerText || "");
       const lowered = (bodyText || "").toLowerCase();
       if (
@@ -226,8 +203,6 @@ export async function runCheck(inputUrl) {
       }
     } catch {}
 
-    await page.waitForTimeout(2000);
-
     // Script scan
     const scripts = await page.locator("script").evaluateAll(nodes =>
       nodes.map((s, idx) => ({
@@ -241,11 +216,11 @@ export async function runCheck(inputUrl) {
     const stubScripts = scripts.filter(s => (s.src || "").toLowerCase().includes("otsdkstub.js"));
     const autoBlockScripts = scripts.filter(s => (s.src || "").toLowerCase().includes("otautoblock.js"));
 
-    const hasDuplicateOtSdkStub = stubScripts.length > 1;
-    const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
-
     const otSDKStubFound = stubScripts.length > 0;
     const autoBlockEnabled = autoBlockScripts.length > 0;
+
+    const hasDuplicateOtSdkStub = stubScripts.length > 1;
+    const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
 
     const primaryUdid = stubScripts.find(s => s.dataDomainScript)?.dataDomainScript || "";
     const productionUdid = cleanUdid(primaryUdid);
@@ -267,7 +242,7 @@ export async function runCheck(inputUrl) {
       domainOutOfScope = Boolean(!match);
     }
 
-    // RuleSet/template selection (your newest requirement)
+    // RuleSet logic
     const ruleSet = Array.isArray(capturedConfig?.RuleSet) ? capturedConfig.RuleSet : [];
     const ruleSetCount = ruleSet.length;
     const skipGeolocation = Boolean(capturedConfig?.SkipGeolocation);
@@ -285,7 +260,7 @@ export async function runCheck(inputUrl) {
         templateName: resolvedTemplateName
       };
     } else {
-      // capture geolocation from OneTrust
+      // Pull geolocation from OneTrust
       try {
         await page.waitForFunction(
           () => window.OneTrust && typeof window.OneTrust.getGeolocationData === "function",
@@ -414,9 +389,15 @@ export async function runCheck(inputUrl) {
     if (browser) await browser.close().catch(() => {});
   }
 }
-   Helpers
--------------------------- */
 
 function normaliseUrl(url) {
   const trimmed = (url || "").trim();
   if (!trimmed) return "";
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function mkFinding(severity, message) {
+  return { severity, message };
+}
+
+function computeSeverity(findings) {
