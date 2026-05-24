@@ -1,0 +1,36 @@
+name: Run Agent.js Test
+
+on:
+  workflow        description: "Website URL to test"  workflow_dispatch:
+        required: true
+        default: "https://example.com"
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      - name: Run agent.js
+        run: |
+          node -e "
+          import('./agent.js').then(async m => {
+            const result = await m.runCheck('${{ github.event.inputs.url }}');
+            console.log(JSON.stringify(result, null, 2));
+          });
+          "
+    inputs:
+      url:
