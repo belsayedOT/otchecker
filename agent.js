@@ -108,8 +108,8 @@ function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
   return best;
 }
 
-export async function runCheck(inputUrl) {
-  const targetUrl = normaliseUrl(inputUrl);
+async function runCheck(inputUrl) {
+	const targetUrl = normaliseUrl(inputUrl);
   if (!targetUrl) throw new Error("url is required");
 
   let browser = null;
@@ -391,4 +391,8 @@ function isTestScript(udid = "") {
 function mkFinding(severity, message) {
   return { severity, message };
 }
+
+
+module.exports = { runCheck };
+
 
