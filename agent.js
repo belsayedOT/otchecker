@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import fs from "fs";
 
 function normaliseUrl(url) {
   const trimmed = (url || "").trim();
@@ -14,6 +15,18 @@ function isTestScript(udid = "") {
   return udid.toLowerCase().endsWith("-test");
 }
 
+async function safeEvaluate(page, expression) {
+  try {
+    return { success: true, value: await page.evaluate(expression) };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+}
+
+function extractBodyPreview(text = "", max = 3000) {
+  return text.length > max ? `${text.slice(0, max)}... [truncated]` : text;
+}
+
 function mkFinding(severity, message) {
   return { severity, message };
 }
@@ -25,149 +38,389 @@ function computeSeverity(findings) {
   return "NONE";
 }
 
-function isDomainMatching(host, domain) {
-  if (!host || !domain) return false;
-  const h = host.toLowerCase();
-  const d = domain.toLowerCase();
-  return h === d || h.endsWith(`.${d}`);
+function looksLikeCspViolation(text = "") {
+  const t = (text || "").toLowerCase();
+  return (
+    t.includes("content security policy") ||
+    t.includes("csp") ||
+    t.includes("violates the following content security policy directive") ||
+    t.includes("refused to load the script") ||
+    t.includes("refused to execute inline script") ||
+    t.includes("unsafe-eval") ||
+    t.includes("unsafe-inline")
+  );
 }
 
+function looksLikeCspNetworkBlock(errText = "") {
+  const t = (errText || "").toLowerCase();
+  return (
+    t.includes("blocked by content security policy") ||
+    t.includes("csp") ||
+    t.includes("unsafe-eval") ||
+    t.includes("unsafe-inline") ||
+    // common chromium-ish patterns when blocked client-side
+    t.includes("err_blocked_by_client") ||
+    t.includes("blocked")
+  );
+}
+
+/**
+ * Exported for server.js:
+ * import { runCheck } from "./agent.js";
+ */
 export async function runCheck(inputUrl) {
   const targetUrl = normaliseUrl(inputUrl);
   if (!targetUrl) throw new Error("url is required");
 
-  let browser = null;
-  let capturedConfig = null;
+  const DEBUG = process.env.DEBUG_ARTIFACTS === "true";
 
+  // Per-run state (no globals)
   const notes = [];
+  const apiCalls = [];
+  const otStubNetworkCalls = [];
+  const otAutoBlockNetworkCalls = [];
+  const possibleJsonResponses = [];
+
+  // CSP tracking
+  const cspConsoleViolations = [];
+  const cspNetworkFailures = [];
+  let hasCspHeaderSeen = false;
+
+  let accessDenied = false;
+  let autoBlockResponseDetails = null;
+  let geoLocationResponseDetails = null;
+
+  let browser = null;
 
   try {
-    browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-
-    page.on("response", async response => {
-      try {
-        const url = response.url().toLowerCase();
-        if (url.endsWith(".json")) {
-          const text = await response.text();
-          const parsed = JSON.parse(text);
-          if (parsed?.Domain) {
-            capturedConfig = parsed;
-          }
-        }
-      } catch {}
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage"]
     });
 
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(5000);
+    const page = await browser.newPage({
+      viewport: { width: 1366, height: 768 },
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    });
 
-    const scripts = await page.locator("script").evaluateAll(nodes =>
-      nodes.map(s => ({
-        src: s.src || "",
-        dataDomainScript: s.getAttribute("data-domain-script") || ""
-      }))
-    );
+    // ---- CSP: capture console violations (very strong signal) ----
+    page.on("console", msg => {
+      try {
+        const text = msg.text?.() || "";
+        if (looksLikeCspViolation(text)) {
+          cspConsoleViolations.push({
+            type: msg.type?.() || "log",
+            text
+          });
+        }
+      } catch {
+        // ignore
+      }
+    });
 
-    const stubScripts = scripts.filter(s =>
-      (s.src || "").toLowerCase().includes("otsdkstub.js")
-    );
+    // ---- CSP: capture request failures ----
+    page.on("requestfailed", request => {
+      try {
+        const url = request.url();
+        const lowerUrl = url.toLowerCase();
+        const failure = request.failure();
+        const errText = failure?.errorText || "";
 
-    const autoBlockScripts = scripts.filter(s =>
-      (s.src || "").toLowerCase().includes("otautoblock.js")
-    );
+        // Focus on OT-critical scripts, but also capture generic CSP blocks
+        const isOtRelevant =
+          lowerUrl.includes("otsdkstub.js") ||
+          lowerUrl.includes("otautoblock.js") ||
+          lowerUrl.includes("cookielaw.org") ||
+          lowerUrl.includes("onetrust");
 
-    const primaryUdid =
-      stubScripts.find(s => s.dataDomainScript)?.dataDomainScript || "";
+        if (isOtRelevant && looksLikeCspNetworkBlock(errText)) {
+          cspNetworkFailures.push({ url, errorText: errText });
+        }
+      } catch {
+        // ignore
+      }
+    });
 
+    // Track key requests
+    page.on("request", request => {
+      const url = request.url();
+      const lowerUrl = url.toLowerCase();
+
+      if (lowerUrl.includes("otsdkstub.js")) {
+        otStubNetworkCalls.push({
+          url,
+          method: request.method(),
+          resourceType: request.resourceType()
+        });
+      }
+
+      if (lowerUrl.includes("otautoblock.js")) {
+        otAutoBlockNetworkCalls.push({
+          url,
+          method: request.method(),
+          resourceType: request.resourceType()
+        });
+      }
+    });
+
+    // Track responses + capture JSON bodies
+    page.on("response", async response => {
+      const url = response.url();
+      const request = response.request();
+      const lowerUrl = url.toLowerCase();
+
+      // Track CSP header existence (context signal)
+      const headers = response.headers?.() || {};
+      if (headers["content-security-policy"] || headers["content-security-policy-report-only"]) {
+        hasCspHeaderSeen = true;
+      }
+
+      const responseSummary = {
+        url,
+        method: request.method(),
+        resourceType: request.resourceType(),
+        status: response.status()
+      };
+
+      apiCalls.push(responseSummary);
+
+      // Capture AutoBlock body
+      if (lowerUrl.includes("otautoblock.js")) {
+        try {
+          const bodyText = await response.text();
+          autoBlockResponseDetails = {
+            ...responseSummary,
+            headers: DEBUG ? headers : undefined,
+            bodyPreview: extractBodyPreview(bodyText),
+            bodyLength: bodyText.length
+          };
+        } catch (error) {
+          autoBlockResponseDetails = { ...responseSummary, error: error.message };
+        }
+      }
+
+      // Capture geolocation response
+      if (lowerUrl.includes("/v1/geo/location")) {
+        try {
+          const bodyText = await response.text();
+          let parsedBody = null;
+          try {
+            parsedBody = JSON.parse(bodyText);
+          } catch {
+            parsedBody = null;
+          }
+
+          geoLocationResponseDetails = {
+            ...responseSummary,
+            headers: DEBUG ? headers : undefined,
+            body: parsedBody ?? bodyText,
+            bodyLength: bodyText.length
+          };
+        } catch (error) {
+          geoLocationResponseDetails = { ...responseSummary, error: error.message };
+        }
+      }
+
+      // Collect *.json responses
+      try {
+        const urlObj = new URL(url);
+        const pathname = urlObj.pathname.toLowerCase();
+
+        if (pathname.endsWith(".json")) {
+          const bodyText = await response.text();
+          possibleJsonResponses.push({
+            url,
+            status: response.status(),
+            resourceType: request.resourceType(),
+            bodyText
+          });
+        }
+      } catch {
+        // ignore URL parse errors
+      }
+    });
+
+    // -------- NAVIGATION --------
+    try {
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+      await page.waitForLoadState("networkidle", { timeout: 30000 }).catch(() => {
+        notes.push("Network did not become idle within 30 seconds.");
+      });
+
+      // Give async OneTrust calls time
+      await page.waitForTimeout(8000);
+    } catch (error) {
+      notes.push(`Page navigation issue: ${error.message}`);
+    }
+
+    // WAF/CDN detection
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    if (
+      bodyText.includes("Access Denied") ||
+      bodyText.includes("You don't have permission to access") ||
+      page.url().includes("errors.edgesuite.net")
+    ) {
+      accessDenied = true;
+      notes.push("Access denied by CDN/WAF. Playwright could not access the real page.");
+    }
+
+    // -------- SCRIPT INSPECTION --------
+    const allFrameScripts = [];
+
+    for (const frame of page.frames()) {
+      try {
+        const scripts = await frame.locator("script").evaluateAll(nodes =>
+          nodes.map((script, index) => ({
+            index,
+            frameUrl: window.location.href,
+            src: script.src || "",
+            id: script.id || "",
+            dataDomainScript: script.getAttribute("data-domain-script") || "",
+            outerHTML: script.outerHTML || "",
+            parentTagName: script.parentElement?.tagName?.toLowerCase() || "",
+            inHead: script.closest("head") !== null,
+            inBody: script.closest("body") !== null
+          }))
+        );
+        allFrameScripts.push(...scripts);
+      } catch {
+        notes.push(`Could not inspect scripts in frame: ${frame.url()}`);
+      }
+    }
+
+    const stubScripts = allFrameScripts.filter(s => {
+      const src = (s.src || "").toLowerCase();
+      const html = (s.outerHTML || "").toLowerCase();
+      return src.includes("otsdkstub.js") || html.includes("otsdkstub.js");
+    });
+
+    const autoBlockScripts = allFrameScripts.filter(s => {
+      const src = (s.src || "").toLowerCase();
+      const html = (s.outerHTML || "").toLowerCase();
+      return src.includes("otautoblock.js") || html.includes("otautoblock.js");
+    });
+
+    const firstStubScript = stubScripts[0] || null;
+    const firstAutoBlockScript = autoBlockScripts[0] || null;
+
+    function getScriptsBefore(targetScript, scriptList) {
+      if (!targetScript) return [];
+      return scriptList
+        .filter(s => s.frameUrl === targetScript.frameUrl)
+        .filter(s => s.index < targetScript.index)
+        .map(s => ({
+          index: s.index,
+          src: s.src,
+          id: s.id,
+          parentTagName: s.parentTagName,
+          inHead: s.inHead,
+          inBody: s.inBody
+        }));
+    }
+
+    const scriptsBeforeOtSDKStub = getScriptsBefore(firstStubScript, allFrameScripts);
+    const scriptsBeforeAutoBlock = getScriptsBefore(firstAutoBlockScript, allFrameScripts);
+
+    // -------- Extract data-domain-script --------
+    const dataDomainScriptValues = stubScripts
+      .map(s => s.dataDomainScript)
+      .filter(Boolean);
+
+    const primaryUdid = dataDomainScriptValues[0] || "";
     const productionUdid = cleanUdid(primaryUdid);
     const usingTestScript = isTestScript(primaryUdid);
 
-    const checkedHost = new URL(targetUrl).hostname || "";
-    const configDomain = capturedConfig?.Domain ?? "";
+    // -------- Capture UDID JSON --------
+    let capturedConfig = null;
+    let capturedConfigUrl = "";
 
-    // ✅ BOOLEAN SAFE (no nulls)
-    let domainScopeValid = false;
-    let domainOutOfScope = false;
+    for (const item of possibleJsonResponses) {
+      try {
+        const pathname = new URL(item.url).pathname.toLowerCase();
 
-    if (usingTestScript) {
-      domainScopeValid = true;
-      domainOutOfScope = false;
+        const isTargetUdidJson =
+          productionUdid &&
+          pathname.endsWith(`/${productionUdid.toLowerCase()}.json`);
 
-    } else if (configDomain && checkedHost) {
-      const match = isDomainMatching(checkedHost, configDomain);
-      domainScopeValid = Boolean(match);
-      domainOutOfScope = Boolean(!match);
+        if (!isTargetUdidJson) continue;
 
-    } else {
-      domainScopeValid = false;
-      domainOutOfScope = false;
+        capturedConfig = JSON.parse(item.bodyText);
+        capturedConfigUrl = item.url;
+        break;
+      } catch {
+        notes.push(`Found possible UDID JSON but could not parse it: ${item.url}`);
+      }
     }
 
-    domainScopeValid = Boolean(domainScopeValid);
-    domainOutOfScope = Boolean(domainOutOfScope);
+    const cookies = await page.context().cookies();
 
-    const otSDKStubFound = stubScripts.length > 0;
-    const autoBlockEnabled = autoBlockScripts.length > 0;
+    // -------- REQUIRED FLAGS --------
+    const otSDKStubFound = stubScripts.length > 0 || otStubNetworkCalls.length > 0;
+    const autoBlockEnabled = autoBlockScripts.length > 0 || otAutoBlockNetworkCalls.length > 0;
 
-    const hasDuplicateOtSdkStub = stubScripts.length > 1;
-    const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
+    const hasDuplicateOtSdkStub = stubScripts.length > 1 || otStubNetworkCalls.length > 1;
+    const hasDuplicateAutoBlock = autoBlockScripts.length > 1 || otAutoBlockNetworkCalls.length > 1;
 
-    const isCspBlocked = false;
-    const accessDenied = false;
+    const scriptsBeforeOtSdkStub = scriptsBeforeOtSDKStub.length > 0;
+    const scriptsBeforeAutoBlockFlag = scriptsBeforeAutoBlock.length > 0;
 
+    const otSdkStubInHead = firstStubScript?.inHead ?? false;
+    const autoBlockInHead = firstAutoBlockScript?.inHead ?? false;
+
+    // -------- CSP BLOCK FLAG (NEW) --------
+    // Strong signals: console violation OR OT request failed with CSP-ish error.
+    // Supporting signal: CSP header seen (not always a blocker).
+    const isCspBlocked =
+      cspConsoleViolations.length > 0 ||
+      cspNetworkFailures.length > 0;
+
+    if (isCspBlocked) {
+      notes.push("CSP violation detected (console and/or request failure).");
+      if (hasCspHeaderSeen) notes.push("CSP header observed in responses.");
+    }
+
+    // -------- High value: issues + recommendations --------
     const issues = [];
     const recommendations = [];
 
-    if (domainOutOfScope) {
-      issues.push(
+    if (isCspBlocked) {
+      issues.push(mkFinding("HIGH", "Content Security Policy (CSP) appears to be blocking OneTrust resources or execution."));
+      recommendations.push(
         mkFinding(
           "HIGH",
-          `Domain mismatch between script and site (${configDomain} vs ${checkedHost})`
+          "Allowlist the OneTrust CDN and required directives in CSP (e.g., script-src for the OneTrust CDN)."
         )
       );
     }
 
+    if (accessDenied) {
+      issues.push(mkFinding("HIGH", "Site appears blocked by CDN/WAF (Access Denied)."));
+      recommendations.push(mkFinding("HIGH", "Ask customer to allowlist your scanner/requests or test from a non-blocked network."));
+    }
+
     if (!otSDKStubFound) {
-      issues.push(mkFinding("HIGH", "otSDKStub.js not detected"));
+      issues.push(mkFinding("HIGH", "otSDKStub.js was not detected in DOM or network calls."));
+      recommendations.push(mkFinding("HIGH", "Confirm OneTrust script is implemented on the page and not blocked by CSP/WAF."));
     }
 
     if (hasDuplicateOtSdkStub) {
-      issues.push(mkFinding("HIGH", "Duplicate otSDKStub.js detected"));
+      issues.push(mkFinding("HIGH", "Duplicate otSDKStub.js detected (DOM and/or network)."));
+      recommendations.push(mkFinding("HIGH", "Remove duplicate OneTrust script to avoid unpredictable banner/consent behaviour."));
     }
 
-    const severity = computeSeverity(issues);
+    if (hasDuplicateAutoBlock) {
+      issues.push(mkFinding("HIGH", "Duplicate otAutoBlock.js detected (DOM and/or network)."));
+      recommendations.push(mkFinding("HIGH", "Remove duplicate AutoBlock include. Duplicate autoblock can break script injection."));
+    }
 
-    return {
-      checkedUrl: targetUrl,
+    if (otSDKStubFound && !otSdkStubInHead) {
+      issues.push(mkFinding("MEDIUM", "otSDKStub.js is not located in the <head> section."));
+      recommendations.push(mkFinding("MEDIUM", "Move otSDKStub.js into <head> as early as possible (before other scripts)."));
+    }
 
-      TenantGuid: capturedConfig?.TenantGuid ?? "",
-      EnvId: capturedConfig?.EnvId ?? "",
-      Domain: configDomain,
-
-      primaryUdid,
-      productionUdid,
-      usingTestScript,
-
-      otSDKStubFound,
-      autoBlockEnabled,
-      hasDuplicateOtSdkStub,
-      hasDuplicateAutoBlock,
-
-      isCspBlocked,
-      accessDenied,
-
-      checkedHost,
-      configDomain,
-      domainScopeValid,
-      domainOutOfScope,
-
-      severity,
-      issues,
-      recommendations,
-      notes
-    };
-
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-}
+    if (autoBlockEnabled && !autoBlockInHead) {
+      issues.push(mkFinding("MEDIUM", "otAutoBlock.js is not located in the <head> section."));
+      recommendations.push(mkFinding
