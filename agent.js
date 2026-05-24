@@ -29,6 +29,28 @@ function lower(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function normaliseConsentModel(consentModel) {
+  if (!consentModel) return "";
+
+  if (typeof consentModel === "string") {
+    return consentModel;
+  }
+
+  if (typeof consentModel === "object") {
+    return (
+      consentModel.Name ||
+      consentModel.name ||
+      consentModel.Value ||
+      consentModel.value ||
+      consentModel.Id ||
+      consentModel.id ||
+      JSON.stringify(consentModel)
+    );
+  }
+
+  return String(consentModel);
+}
+
 function toArray(value) {
   if (!value) return [];
 
@@ -424,6 +446,7 @@ function validateGcsDefault({
   triggerRuleSet,
 }) {
   const uniqueGcsValues = [...new Set((gcsValues || []).filter(Boolean))];
+  const normalisedConsentModel = lower(normaliseConsentModel(consentModel));
 
   if (optanonAlertBoxClosedExists) {
     return {
@@ -445,7 +468,7 @@ function validateGcsDefault({
     };
   }
 
-  if (uniqueGcsValues.includes("G100") && lower(consentModel) === "opt-in") {
+  if (uniqueGcsValues.includes("G100") && normalisedConsentModel === "opt-in") {
     return {
       status: "CORRECT_DEFAULT",
       message:
@@ -455,7 +478,7 @@ function validateGcsDefault({
     };
   }
 
-  if (uniqueGcsValues.includes("G111") && lower(consentModel) === "opt-out") {
+  if (uniqueGcsValues.includes("G111") && normalisedConsentModel === "opt-out") {
     return {
       status: "CORRECT_DEFAULT",
       message:
@@ -746,11 +769,33 @@ export async function runCheck(inputUrl, options = {}) {
       );
 
       const consentModeData = await page.evaluate(() => {
+        function normaliseConsentModelInBrowser(consentModel) {
+          if (!consentModel) return "";
+
+          if (typeof consentModel === "string") {
+            return consentModel;
+          }
+
+          if (typeof consentModel === "object") {
+            return (
+              consentModel.Name ||
+              consentModel.name ||
+              consentModel.Value ||
+              consentModel.value ||
+              consentModel.Id ||
+              consentModel.id ||
+              JSON.stringify(consentModel)
+            );
+          }
+
+          return String(consentModel);
+        }
+
         try {
           const data = window.OneTrust.GetDomainData();
 
           return {
-            consentModel: data?.ConsentModel ?? "",
+            consentModel: normaliseConsentModelInBrowser(data?.ConsentModel),
             googleEnabled: data?.GoogleConsent?.GCEnable ?? null,
             microsoftEnabled: data?.MCMData?.Enabled ?? null,
             amazonEnabled: data?.ACMData?.Enabled ?? null,
@@ -783,7 +828,7 @@ export async function runCheck(inputUrl, options = {}) {
         }
       });
 
-      consentModel = consentModeData.consentModel;
+      consentModel = normaliseConsentModel(consentModeData.consentModel);
       googleConsentModeEnabled = consentModeData.googleEnabled;
       microsoftConsentModeEnabled = consentModeData.microsoftEnabled;
       amazonConsentModeEnabled = consentModeData.amazonEnabled;
