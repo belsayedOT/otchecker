@@ -646,12 +646,20 @@ export async function runCheck(inputUrl, options = {}) {
       navigationError = err?.message || String(err);
     }
 
+    const isFirewallTimeout = /timed out|timeout|http request timed out|HttpRequestTimeout|ERR_CONNECTION_RESET|ECONNRESET|ECONNREFUSED|ENOTFOUND/i.test(
+      navigationError
+    );
+    const botNotice = isFirewallTimeout
+      ? "🤖 The bot cannot access the website due to Site Firewall restrictions."
+      : "";
+
     if (navigationError) {
       return {
         checkedUrl: targetUrl,
         success: false,
-        accessDenied,
+        accessDenied: accessDenied || isFirewallTimeout,
         error: navigationError,
+        botNotice,
       };
     }
 
