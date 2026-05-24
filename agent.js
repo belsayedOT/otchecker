@@ -1,8 +1,6 @@
-import { chromium } from "playwright";
-
-/* -------------------------
-   Helpers
----------------- "";-------------------------- */
+import { chromium } from "playwright";import { chromium } from "function normaliseUrl(url) {
+  const trimmed = (url || "").trim();
+  if (!trimmed) return "";
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
@@ -34,100 +32,72 @@ function isDomainMatching(host, domain) {
 
 function looksLikeUdidJson(obj) {
   if (!obj || typeof obj !== "object") return false;
-  const keys = [
-    "TenantGuid",
-    "EnvId",
-    "Domain",
-    "Version",
-    "ScriptType",
-    "RuleSet",
-    "SkipGeolocation",
-    "LanguageDetectionEnabled",
-    "LanguageDetectionByHtml",
-    "GeoRuleGroupName"
-  ];
-  return keys.some(k => Object.prototype.hasOwnProperty.call(obj, k));
+  return Array.isArray(obj.RuleSet);
 }
 
 function toList(value) {
   if (!value) return [];
-  if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
+  if (Array.isArray(value)) return value.map(v => String(v).trim());
 
-  if (typeof value === "string") {
-    return value
-      .split(/[\s,;]+/g)
-      .map(v => v.trim())
-      .filter(Boolean);
-  }
-  return [String(value).trim()].filter(Boolean);
+  return String(value)
+    .split(/[\s,;]+/)
+    .map(v => v.trim())
+    .filter(Boolean);
 }
 
 function lowerList(value) {
   return toList(value).map(v => v.toLowerCase());
 }
 
-/**
- * Template selection (your requirements):
- * - match country in RuleSet[x].Countries
- * - match state in RuleSet[x].States IF States is not empty
- * - States can be empty => wildcard (country-only match)
- * - prefer exact state match over wildcard
- */
+/* -------------------------
+   Template Resolution Logic
+-------------------------- */
+
 function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
-  const country = (geoCountry || "").toLowerCase().trim();
-  const state = (geoState || "").toLowerCase().trim();
+  const country = (geoCountry || "").toLowerCase();
+  const state = (geoState || "").toLowerCase();
 
-  if (!Array.isArray(ruleSet) || ruleSet.length === 0) {
-    return { templateName: "", matchType: "no_rules", matchedIndex: -1, matchedRule: null };
-  }
-  if (!country) {
-    return { templateName: "", matchType: "no_geo_country", matchedIndex: -1, matchedRule: null };
+  if (!ruleSet?.length) {
+    return { templateName: "", matchType: "no_rules" };
   }
 
-  let best = null;
+  let bestMatch = null;
 
   for (let i = 0; i < ruleSet.length; i++) {
-    const r = ruleSet[i] || {};
+    const rule = ruleSet[i];
 
-    const countries = lowerList(r.Countries ?? r.countries);
-    const states = lowerList(r.States ?? r.states);
+    const countries = lowerList(rule.Countries ?? rule.countries);
+    const states = lowerList(rule.States ?? rule.states);
 
     if (!countries.includes(country)) continue;
 
-    const hasStateList = states.length > 0;
-    const exactStateMatch = hasStateList && state && states.includes(state);
-    const wildcardState = !hasStateList;
+    const hasStates = states.length > 0;
+    const stateMatch = hasStates && states.includes(state);
 
-    // if rule expects states but geo state missing -> skip
-    if (hasStateList && !state) continue;
+    // Prefer state match
+    if (stateMatch) {
+      return {
+        templateName: rule.TemplateName ?? "",
+        matchType: "country_and_state",
+        matchedIndex: i
+      };
+    }
 
-    // if state present but not in states list -> skip
-    if (hasStateList && state && !exactStateMatch) continue;
-
-    const score = exactStateMatch ? 3 : 2;
-
-    const candidate = {
-      matchedIndex: i,
-      matchedRule: r,
-      templateName: r.TemplateName ?? "",
-      matchType: exactStateMatch
-        ? "country_and_state"
-        : (wildcardState ? "country_and_wildcard_state" : "country_only"),
-      score
-    };
-
-    if (!best || candidate.score > best.score) best = candidate;
+    // fallback: country only
+    if (!hasStates) {
+      bestMatch = {
+        templateName: rule.TemplateName ?? "",
+        matchType: "country_only",
+        matchedIndex: i
+      };
+    }
   }
 
-  if (!best) {
-    return { templateName: "", matchType: "no_match", matchedIndex: -1, matchedRule: null };
-  }
-
-  return best;
+  return bestMatch || { templateName: "", matchType: "no_match" };
 }
 
 /* -------------------------
-   Main Export (ESM)
+   Main Export
 -------------------------- */
 
 export async function runCheck(inputUrl) {
@@ -135,48 +105,28 @@ export async function runCheck(inputUrl) {
   if (!targetUrl) throw new Error("url is required");
 
   let browser = null;
-
-  const notes = [];
   let capturedConfig = null;
   let capturedConfigUrl = "";
 
-  let isCspBlocked = false; // reserved
-  let accessDenied = false;
-  let navigationError = null;
+  let geoCountry = "";
+  let geoState = "";
 
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
-    // capture udid.json-like response + accessDenied
+    /* -------------------------
+       Capture udid.json
+    -------------------------- */
+
     page.on("response", async response => {
       try {
-        const status = response.status();
-        const url = response.url();
+        const url = response.url().toLowerCase();
 
-        if (response.request().resourceType() === "document" && (status === 401 || status === 403)) {
-          accessDenied = true;
-        }
+        if (!url.includes(".json")) return;
 
-        const lowerUrl = url.toLowerCase();
-        const contentType = (response.headers()?.["content-type"] || "").toLowerCase();
-
-        const isLikelyJson =
-          lowerUrl.includes(".json") ||
-          contentType.includes("application/json") ||
-          contentType.includes("text/json");
-
-        if (!isLikelyJson) return;
-
-        const text = await response.text().catch(() => "");
-        if (!text) return;
-
-        let parsed = null;
-        try {
-          parsed = JSON.parse(text);
-        } catch {
-          return;
-        }
+        const text = await response.text();
+        const parsed = JSON.parse(text);
 
         if (looksLikeUdidJson(parsed)) {
           capturedConfig = parsed;
@@ -185,209 +135,77 @@ export async function runCheck(inputUrl) {
       } catch {}
     });
 
-    // navigation
-    let navigationResponse = null;
-    try {
-      navigationResponse = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    } catch (err) {
-      navigationError = err?.message || String(err);
-    }
-
-    if (!navigationResponse && navigationError) {
-      return {
-        checkedUrl: targetUrl,
-        accessDenied: false,
-        isCspBlocked: false,
-        navigationError,
-        severity: "HIGH",
-        issues: [mkFinding("HIGH", `Navigation failed: ${navigationError}`)],
-        recommendations: [
-          "Verify the URL is correct (e.g., www vs wwww)",
-          "Check DNS resolution / network access from runner"
-        ],
-        notes
-      };
-    }
-
-    if (navigationResponse) {
-      const status = navigationResponse.status();
-      if (status === 401 || status === 403) accessDenied = true;
-    }
-
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(5000);
 
-    // scripts scan
-    const scripts = await page.locator("script").evaluateAll(nodes =>
-      nodes.map((s, idx) => ({
-        index: idx,
-        inHead: !!(document.head && document.head.contains(s)),
-        src: s.src || "",
-        dataDomainScript: s.getAttribute("data-domain-script") || ""
-      }))
-    );
+    /* -------------------------
+       Extract config
+    -------------------------- */
 
-    const stubScripts = scripts.filter(s =>
-      (s.src || "").toLowerCase().includes("otsdkstub.js")
-    );
+    const ruleSet = capturedConfig?.RuleSet || [];
+    const skipGeolocation = capturedConfig?.SkipGeolocation === true;
 
-    const autoBlockScripts = scripts.filter(s =>
-      (s.src || "").toLowerCase().includes("otautoblock.js")
-    );
-
-    const primaryUdid =
-      stubScripts.find(s => s.dataDomainScript)?.dataDomainScript || "";
-
-    const productionUdid = cleanUdid(primaryUdid);
-    const usingTestScript = isTestScript(primaryUdid);
-
-    const checkedHost = new URL(targetUrl).hostname || "";
-    const configDomain = capturedConfig?.Domain ?? "";
-
-    let domainScopeValid = false;
-    let domainOutOfScope = false;
-
-    if (usingTestScript) {
-      domainScopeValid = true;
-      domainOutOfScope = false;
-    } else if (configDomain && checkedHost) {
-      const match = isDomainMatching(checkedHost, configDomain);
-      domainScopeValid = Boolean(match);
-      domainOutOfScope = Boolean(!match);
-    }
-
-    const otSDKStubFound = stubScripts.length > 0;
-    const autoBlockEnabled = autoBlockScripts.length > 0;
-
-    const hasDuplicateOtSdkStub = stubScripts.length > 1;
-    const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
-
-    // RuleSet/SkipGeolocation/template resolution
-    const ruleSet = Array.isArray(capturedConfig?.RuleSet) ? capturedConfig.RuleSet : [];
-    const ruleSetCount = ruleSet.length;
-    const skipGeolocation = Boolean(capturedConfig?.SkipGeolocation);
-
-    let geoCountry = "";
-    let geoState = "";
     let resolvedTemplateName = "";
-    let resolvedRuleInfo = { matchedIndex: -1, matchType: "not_evaluated" };
+    let resolvedRuleInfo = {};
+
+    /* -------------------------
+       Apply your logic
+    -------------------------- */
 
     if (skipGeolocation) {
-      resolvedTemplateName = ruleSet?.[0]?.TemplateName ?? "";
+      resolvedTemplateName = ruleSet?.[0]?.TemplateName || "";
       resolvedRuleInfo = {
-        matchedIndex: ruleSetCount > 0 ? 0 : -1,
-        matchType: "skip_geolocation_true_rule0",
-        templateName: resolvedTemplateName
+        matchType: "skip_geolocation_rule0",
+        matchedIndex: 0
       };
     } else {
-      // get geo from OneTrust.getGeolocationData()
       try {
         await page.waitForFunction(
-          () => window.OneTrust && typeof window.OneTrust.getGeolocationData === "function",
-          { timeout: 8000 }
+          () => window.OneTrust?.getGeolocationData,
+          { timeout: 5000 }
         );
 
-        const geo = await page.evaluate(async () => {
+        const geo = await page.evaluate(() => {
           try {
-            const fn = window.OneTrust?.getGeolocationData;
-            if (typeof fn !== "function") return null;
-            const res = fn.call(window.OneTrust);
-            if (res && typeof res.then === "function") return await res;
-            return res ?? null;
+            return window.OneTrust.getGeolocationData();
           } catch {
             return null;
           }
         });
 
-        geoCountry = geo?.country ?? "";
-        geoState = geo?.state ?? "";
+        geoCountry = geo?.country || "";
+        geoState = geo?.state || "";
       } catch {}
 
       const match = resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState);
-      resolvedTemplateName = match.templateName || "";
-      resolvedRuleInfo = {
-        matchedIndex: match.matchedIndex,
-        matchType: match.matchType,
-        templateName: match.templateName || "",
-        geoCountry,
-        geoState
-      };
-    }
 
-    // findings
-    const issues = [];
-    const recommendations = [];
-
-    if (accessDenied) {
-      issues.push(mkFinding("HIGH", "Access denied or blocked (401/403 detected)"));
+      resolvedTemplateName = match.templateName;
+      resolvedRuleInfo = match;
     }
-    if (domainOutOfScope) {
-      issues.push(mkFinding("HIGH", `Domain mismatch (${configDomain} vs ${checkedHost})`));
-    }
-    if (!otSDKStubFound) {
-      issues.push(mkFinding("HIGH", "otSDKStub.js not detected"));
-    }
-    if (hasDuplicateOtSdkStub) {
-      issues.push(mkFinding("HIGH", "Duplicate otSDKStub.js detected"));
-    }
-    if (hasDuplicateAutoBlock) {
-      issues.push(mkFinding("MEDIUM", "Duplicate otAutoBlock.js detected"));
-    }
-
-    const severity = computeSeverity(issues);
 
     return {
       checkedUrl: targetUrl,
 
       udidJsonUrl: capturedConfigUrl,
 
-      TenantGuid: capturedConfig?.TenantGuid ?? "",
-      EnvId: capturedConfig?.EnvId ?? "",
-      Domain: configDomain,
-
-      udidJson: {
-        Version: capturedConfig?.Version ?? "",
-        ScriptType: capturedConfig?.ScriptType ?? "",
-        LanguageDetectionByHtml: capturedConfig?.LanguageDetectionByHtml ?? "",
-        LanguageDetectionEnabled: capturedConfig?.LanguageDetectionEnabled ?? "",
-        GeoRuleGroupName: capturedConfig?.GeoRuleGroupName ?? "",
-        SkipGeolocation: skipGeolocation,
-        RuleSetCount: ruleSetCount
-      },
-
-      resolvedTemplateName,
-      resolvedRuleInfo,
+      SkipGeolocation: skipGeolocation,
+      ruleSetCount: ruleSet.length,
 
       geoLocation: {
         country: geoCountry,
         state: geoState
       },
 
-      primaryUdid,
-      productionUdid,
-      usingTestScript,
-
-      otSDKStubFound,
-      autoBlockEnabled,
-      hasDuplicateOtSdkStub,
-      hasDuplicateAutoBlock,
-
-      isCspBlocked,
-      accessDenied,
-
-      checkedHost,
-      configDomain,
-      domainScopeValid,
-      domainOutOfScope,
-
-      severity,
-      issues,
-      recommendations,
-      notes
+      resolvedTemplateName,
+      resolvedRuleInfo
     };
+
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
 }
 
-function normaliseUrl(url) {
-  const trimmed = (url || "").trim();
+/* -------------------------
+   Helpers
+-------------------------- */
+
