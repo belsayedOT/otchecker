@@ -5,6 +5,7 @@ function normaliseUrl(url) {
   if (!trimmed) return "";
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
+
 function cleanUdid(udid = "") {
   return udid.toLowerCase().endsWith("-test") ? udid.slice(0, -5) : udid;
 }
@@ -140,13 +141,7 @@ export async function runCheck(inputUrl) {
       const match = isDomainMatching(checkedHost, configDomain);
       domainScopeValid = Boolean(match);
       domainOutOfScope = Boolean(!match);
-    } else {
-      domainScopeValid = false;
-      domainOutOfScope = false;
     }
-
-    domainScopeValid = Boolean(domainScopeValid);
-    domainOutOfScope = Boolean(domainOutOfScope);
 
     const otSDKStubFound = stubScripts.length > 0;
     const autoBlockEnabled = autoBlockScripts.length > 0;
@@ -158,7 +153,9 @@ export async function runCheck(inputUrl) {
     const recommendations = [];
 
     if (accessDenied) {
-      issues.push(mkFinding("HIGH", "Access denied or blocked (401/403 or page content detected)"));
+      issues.push(
+        mkFinding("HIGH", "Access denied or blocked (401/403 or page content detected)")
+      );
     }
 
     if (domainOutOfScope) {
@@ -214,4 +211,3 @@ export async function runCheck(inputUrl) {
     if (browser) await browser.close().catch(() => {});
   }
 }
-  if (!trimmed) return "";
