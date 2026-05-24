@@ -11,9 +11,9 @@ function looksLikeUdidJson(obj) {
 
   return Boolean(
     obj.Domain &&
-    obj.Version &&
-    obj.ScriptType &&
-    Array.isArray(obj.RuleSet)
+      obj.Version &&
+      obj.ScriptType &&
+      Array.isArray(obj.RuleSet)
   );
 }
 
@@ -34,6 +34,10 @@ function toArray(value) {
 
   if (Array.isArray(value)) {
     return value;
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value);
   }
 
   return [value];
@@ -97,6 +101,68 @@ function getRuleTemplateName(rule) {
   );
 }
 
+function getRuleLanguages(rule) {
+  const languageSwitcher =
+    rule?.LanguageSwitcherPlaceholder ||
+    rule?.languageSwitcherPlaceholder ||
+    {};
+
+  const available = Object.values(languageSwitcher)
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+
+  const uniqueAvailable = [...new Set(available)];
+
+  return {
+    default:
+      languageSwitcher?.default ||
+      rule?.DefaultLanguage ||
+      rule?.defaultLanguage ||
+      "",
+    available: uniqueAvailable,
+  };
+}
+
+function isGlobalRule(rule) {
+  return lower(rule?.Name) === "global" || rule?.Global === true;
+}
+
+function summariseRuleSet(ruleSet) {
+  return ruleSet.map((rule, index) => {
+    const globalRule = isGlobalRule(rule);
+
+    return {
+      index,
+      Id: rule?.Id ?? "",
+      Name: rule?.Name ?? "",
+      IsGPPEnabled: rule?.IsGPPEnabled ?? false,
+      GCEnable: rule?.GCEnable ?? false,
+      TemplateName: getRuleTemplateName(rule),
+      Type: rule?.Type ?? "",
+      VariantEnabled: rule?.VariantEnabled ?? false,
+      Default: rule?.Default ?? false,
+      Global: rule?.Global ?? false,
+      languages: getRuleLanguages(rule),
+
+      countries: globalRule
+        ? []
+        : getRuleCountries(rule),
+
+      states: globalRule
+        ? []
+        : getRuleStates(rule),
+
+      countriesSummary: globalRule
+        ? "Global rule - countries hidden from summary."
+        : `${getRuleCountries(rule).length} country value(s).`,
+
+      statesSummary: globalRule
+        ? "Global rule - states hidden from summary."
+        : `${getRuleStates(rule).length} state value(s).`,
+    };
+  });
+}
+
 function findMatchingRuleSet(ruleSet, geoData) {
   const country = lower(
     geoData?.country ||
@@ -119,7 +185,7 @@ function findMatchingRuleSet(ruleSet, geoData) {
       matched: false,
       matchReason: "No country was returned from OneTrust.getGeolocationData().",
       matchedRuleIndex: null,
-      templateName: "",
+      rule: null,
     };
   }
 
@@ -143,7 +209,7 @@ function findMatchingRuleSet(ruleSet, geoData) {
             ? "Matched by country. RuleSet States is empty, so state was not required."
             : "Matched by country and state.",
         matchedRuleIndex: i,
-        templateName: getRuleTemplateName(rule),
+        rule,
       };
     }
   }
@@ -152,7 +218,259 @@ function findMatchingRuleSet(ruleSet, geoData) {
     matched: false,
     matchReason: "No RuleSet item matched the detected country/state.",
     matchedRuleIndex: null,
-    templateName: "",
+    rule: null,
+  };
+}
+
+function summariseTriggeredRuleSet(matchResult) {
+  const rule = matchResult?.rule;
+
+  if (!rule) {
+    return {
+      matched: false,
+      matchReason: matchResult?.matchReason || "",
+      matchedRuleIndex: matchResult?.matchedRuleIndex ?? null,
+      Id: "",
+      Name: "",
+      TemplateName: "",
+      Type: "",
+      IsGPPEnabled: false,
+      GCEnable: false,
+      VariantEnabled: false,
+      Default: false,
+      languages: {
+        default: "",
+        available: [],
+      },
+    };
+  }
+
+  return {
+    matched: matchResult.matched,
+    matchReason: matchResult.matchReason,
+    matchedRuleIndex: matchResult.matchedRuleIndex,
+    Id: rule?.Id ?? "",
+    Name: rule?.Name ?? "",
+    TemplateName: getRuleTemplateName(rule),
+    Type: rule?.Type ?? "",
+    IsGPPEnabled: rule?.IsGPPEnabled ?? false,
+    GCEnable: rule?.GCEnable ?? false,
+    VariantEnabled: rule?.VariantEnabled ?? false,
+    Default: rule?.Default ?? false,
+    languages: getRuleLanguages(rule),
+  };
+}
+
+function getHostname(value) {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isOneTrustCdnHost(hostname) {
+  const host = lower(hostname);
+
+  return (
+    host.includes("cdn.cookielaw.org") ||
+    host.includes("cookie-cdn.cookiepro.com") ||
+    host.includes("geolocation.onetrust.com") ||
+    host.includes("privacyportal.onetrust.com")
+  );
+}
+
+function classifyScriptHosting(scriptUrl, pageUrl) {
+  if (!scriptUrl) {
+    return {
+      url: "",
+      hostingType: "NOT_FOUND",
+      flagged: false,
+      message: "Script was not found.",
+    };
+  }
+
+  const scriptHost = getHostname(scriptUrl);
+  const pageHost = getHostname(pageUrl);
+
+  if (!scriptHost) {
+    return {
+      url: scriptUrl,
+      hostingType: "UNKNOWN",
+      flagged: true,
+      message: "Could not identify script host.",
+    };
+  }
+
+  if (scriptHost === pageHost || scriptHost.endsWith(`.${pageHost}`)) {
+    return {
+      url: scriptUrl,
+      hostingType: "LOCAL_SITE",
+      flagged: false,
+      message: "Script appears to be hosted on the scanned website domain.",
+    };
+  }
+
+  if (isOneTrustCdnHost(scriptHost)) {
+    return {
+      url: scriptUrl,
+      hostingType: "ONETRUST_CDN",
+      flagged: false,
+      message: "Script appears to be hosted on a recognised OneTrust CDN/domain.",
+    };
+  }
+
+  return {
+    url: scriptUrl,
+    hostingType: "EXTERNAL_NON_ONETRUST",
+    flagged: true,
+    message:
+      "Script is hosted externally but not on a recognised OneTrust CDN/domain.",
+  };
+}
+
+function findScriptByName(scripts, filename) {
+  const target = lower(filename);
+
+  return scripts.filter((script) =>
+    lower(script.src).includes(target)
+  );
+}
+
+function getCookieByName(cookies, name) {
+  const target = lower(name);
+  return cookies.find((cookie) => lower(cookie.name) === target) || null;
+}
+
+function extractQueryParam(url, paramName) {
+  try {
+    const parsed = new URL(url);
+    return parsed.searchParams.get(paramName);
+  } catch {
+    return null;
+  }
+}
+
+function isGoogleAnalyticsOrTagUrl(url) {
+  const value = lower(url);
+
+  return (
+    value.includes("google-analytics.com/g/collect") ||
+    value.includes("google-analytics.com/collect") ||
+    value.includes("googletagmanager.com/gtag/js") ||
+    value.includes("googletagmanager.com/gtm.js")
+  );
+}
+
+function isGoogleAnalyticsCollectionUrl(url) {
+  const value = lower(url);
+
+  return (
+    value.includes("google-analytics.com/g/collect") ||
+    value.includes("google-analytics.com/collect")
+  );
+}
+
+function evaluateGcmDefaultsFromDataLayer(dataLayer) {
+  const entries = Array.isArray(dataLayer) ? dataLayer : [];
+
+  const defaultEntries = entries.filter((entry) => {
+    const text = JSON.stringify(entry || {}).toLowerCase();
+
+    return (
+      text.includes("consent") &&
+      text.includes("default")
+    );
+  });
+
+  return {
+    gcmDefaultsFound: defaultEntries.length > 0,
+    gcmDefaultEntries: defaultEntries,
+  };
+}
+
+function evaluateGcmMode({
+  gtagDetectedBeforeConsent,
+  optanonAlertBoxClosedExists,
+}) {
+  if (optanonAlertBoxClosedExists) {
+    return {
+      inferredMode: "CONSENT_ALREADY_GIVEN_OR_CLOSED",
+      message:
+        "OptanonAlertBoxClosed cookie exists, so this is not a clean pre-consent state.",
+    };
+  }
+
+  if (gtagDetectedBeforeConsent) {
+    return {
+      inferredMode: "ADVANCED_MODE_LIKELY",
+      message:
+        "Google tag/analytics activity was detected before OptanonAlertBoxClosed existed. This likely indicates Google Consent Mode advanced mode.",
+    };
+  }
+
+  return {
+    inferredMode: "BASIC_MODE_LIKELY",
+    message:
+      "Google tag/analytics activity was not detected before OptanonAlertBoxClosed existed. This potentially indicates Google Consent Mode basic mode.",
+  };
+}
+
+function validateGcsDefault({
+  gcsValues,
+  optanonAlertBoxClosedExists,
+  consentModel,
+  location,
+  triggerRuleSet,
+}) {
+  const uniqueGcsValues = [...new Set((gcsValues || []).filter(Boolean))];
+
+  if (optanonAlertBoxClosedExists) {
+    return {
+      status: "NOT_PRE_CONSENT",
+      message:
+        "OptanonAlertBoxClosed exists, so GCS default validation was not evaluated as a clean pre-consent state.",
+      location,
+      triggerRuleSet,
+    };
+  }
+
+  if (uniqueGcsValues.length === 0) {
+    return {
+      status: "GCS_NOT_FOUND",
+      message:
+        "Google Analytics collection calls were detected without a GCS parameter, or no GA collection call with GCS was found. Review whether Consent Mode is enabled in GTM/GA.",
+      location,
+      triggerRuleSet,
+    };
+  }
+
+  if (uniqueGcsValues.includes("G100") && lower(consentModel) === "opt-in") {
+    return {
+      status: "CORRECT_DEFAULT",
+      message:
+        "GCS is G100 before consent and ConsentModel is opt-in. Consent default appears correctly set.",
+      location,
+      triggerRuleSet,
+    };
+  }
+
+  if (uniqueGcsValues.includes("G111") && lower(consentModel) === "opt-out") {
+    return {
+      status: "CORRECT_DEFAULT",
+      message:
+        "GCS is G111 before consent and ConsentModel is opt-out. Consent default appears correctly set.",
+      location,
+      triggerRuleSet,
+    };
+  }
+
+  return {
+    status: "REVIEW_REQUIRED",
+    message:
+      "GCS value does not match the expected default for the detected OneTrust ConsentModel. Review GCM consent defaults or OneTrust Google Consent Mode backend configuration for this region.",
+    location,
+    triggerRuleSet,
   };
 }
 
@@ -176,6 +494,9 @@ export async function runCheck(inputUrl, options = {}) {
   let capturedUdidJsonUrl = "";
   let accessDenied = false;
 
+  const googleNetworkRequests = [];
+  const googleAnalyticsCollectionCalls = [];
+
   if (!targetUrl) {
     return {
       checkedUrl: "",
@@ -194,6 +515,32 @@ export async function runCheck(inputUrl, options = {}) {
     });
 
     const page = await context.newPage();
+
+    page.on("request", (request) => {
+      try {
+        const url = request.url();
+
+        if (isGoogleAnalyticsOrTagUrl(url)) {
+          googleNetworkRequests.push({
+            url,
+            resourceType: request.resourceType(),
+            method: request.method(),
+          });
+        }
+
+        if (isGoogleAnalyticsCollectionUrl(url)) {
+          googleAnalyticsCollectionCalls.push({
+            url,
+            resourceType: request.resourceType(),
+            method: request.method(),
+            gcs: extractQueryParam(url, "gcs"),
+            gcd: extractQueryParam(url, "gcd"),
+          });
+        }
+      } catch {
+        // Continue scan.
+      }
+    });
 
     page.on("response", async (response) => {
       try {
@@ -248,6 +595,14 @@ export async function runCheck(inputUrl, options = {}) {
 
     const finalUrl = page.url();
 
+    const cookies = await context.cookies();
+    const optanonAlertBoxClosedCookie = getCookieByName(
+      cookies,
+      "OptanonAlertBoxClosed"
+    );
+
+    const optanonAlertBoxClosedExists = Boolean(optanonAlertBoxClosedCookie);
+
     const scripts = await page.locator("script").evaluateAll((nodes) =>
       nodes.map((script, index) => ({
         index,
@@ -257,13 +612,12 @@ export async function runCheck(inputUrl, options = {}) {
       }))
     );
 
-    const otSdkStubScripts = scripts.filter((script) =>
-      script.src.toLowerCase().includes("otsdkstub")
-    );
-
-    const otAutoBlockScripts = scripts.filter((script) =>
-      script.src.toLowerCase().includes("otautoblock")
-    );
+    const otSdkStubScripts = findScriptByName(scripts, "otsdkstub");
+    const otAutoBlockScripts = findScriptByName(scripts, "otautoblock");
+    const otCCPAiabScripts = findScriptByName(scripts, "otCCPAiab.js");
+    const otBannerSdkScripts = findScriptByName(scripts, "otBannerSdk.js");
+    const otTCFScripts = findScriptByName(scripts, "otTCF.js");
+    const otGPPScripts = findScriptByName(scripts, "otGPP.js");
 
     const oneTrustScripts = [
       ...otSdkStubScripts,
@@ -291,12 +645,21 @@ export async function runCheck(inputUrl, options = {}) {
     const otSdkStubInHead = otSdkStubScripts.some((script) => script.inHead);
     const otAutoBlockInHead = otAutoBlockScripts.some((script) => script.inHead);
 
+    const otSdkStubPrimaryUrl = otSdkStubScripts[0]?.src || "";
+    const otAutoBlockPrimaryUrl = otAutoBlockScripts[0]?.src || "";
+
+    const scriptHosting = {
+      otSdkStub: classifyScriptHosting(otSdkStubPrimaryUrl, finalUrl),
+      otAutoBlock: classifyScriptHosting(otAutoBlockPrimaryUrl, finalUrl),
+    };
+
     const ruleSet = Array.isArray(capturedUdidJson?.RuleSet)
       ? capturedUdidJson.RuleSet
       : [];
 
     const skipGeolocation = capturedUdidJson?.SkipGeolocation === true;
     const ruleSetCount = ruleSet.length;
+    const ruleSetSummary = summariseRuleSet(ruleSet);
 
     const shouldSkipLocationInfo =
       ruleSetCount === 1 && skipGeolocation === true;
@@ -304,20 +667,21 @@ export async function runCheck(inputUrl, options = {}) {
     let geolocationData = null;
     let detectedCountry = "";
     let detectedState = "";
-    let matchedRuleSet = {
+
+    let triggerRuleMatch = {
       matched: false,
       matchReason: "",
       matchedRuleIndex: null,
-      templateName: "",
+      rule: null,
     };
 
     if (shouldSkipLocationInfo) {
-      matchedRuleSet = {
+      triggerRuleMatch = {
         matched: true,
         matchReason:
           "SkipGeolocation is true and RuleSet has only one item, so RuleSet[0] was used.",
         matchedRuleIndex: 0,
-        templateName: getRuleTemplateName(ruleSet[0]),
+        rule: ruleSet[0] || null,
       };
     } else if (skipGeolocation === false) {
       try {
@@ -352,22 +716,26 @@ export async function runCheck(inputUrl, options = {}) {
           geolocationData?.Region ||
           "";
 
-        matchedRuleSet = findMatchingRuleSet(ruleSet, geolocationData);
+        triggerRuleMatch = findMatchingRuleSet(ruleSet, geolocationData);
       } catch {
         geolocationData = null;
-        matchedRuleSet = {
+        triggerRuleMatch = {
           matched: false,
           matchReason:
             "SkipGeolocation is false, but OneTrust.getGeolocationData() was not available or did not return data.",
           matchedRuleIndex: null,
-          templateName: "",
+          rule: null,
         };
       }
     }
 
+    const triggerRuleSet = summariseTriggeredRuleSet(triggerRuleMatch);
+
     let googleConsentModeEnabled = null;
     let microsoftConsentModeEnabled = null;
     let amazonConsentModeEnabled = null;
+    let consentModel = "";
+    let enabledSdkDetails = {};
 
     try {
       await page.waitForFunction(
@@ -377,32 +745,116 @@ export async function runCheck(inputUrl, options = {}) {
         { timeout: oneTrustTimeoutMs }
       );
 
-      const consentModes = await page.evaluate(() => {
+      const consentModeData = await page.evaluate(() => {
         try {
           const data = window.OneTrust.GetDomainData();
 
           return {
-            google: data?.GoogleConsent?.GCEnable ?? null,
-            microsoft: data?.MCMData?.Enabled ?? null,
-            amazon: data?.ACMData?.Enabled ?? null,
+            consentModel: data?.ConsentModel ?? "",
+            googleEnabled: data?.GoogleConsent?.GCEnable ?? null,
+            microsoftEnabled: data?.MCMData?.Enabled ?? null,
+            amazonEnabled: data?.ACMData?.Enabled ?? null,
+
+            GoogleConsent:
+              data?.GoogleConsent?.GCEnable === true
+                ? data?.GoogleConsent
+                : null,
+
+            MCMData:
+              data?.MCMData?.Enabled === true
+                ? data?.MCMData
+                : null,
+
+            ACMData:
+              data?.ACMData?.Enabled === true
+                ? data?.ACMData
+                : null,
           };
         } catch {
           return {
-            google: null,
-            microsoft: null,
-            amazon: null,
+            consentModel: "",
+            googleEnabled: null,
+            microsoftEnabled: null,
+            amazonEnabled: null,
+            GoogleConsent: null,
+            MCMData: null,
+            ACMData: null,
           };
         }
       });
 
-      googleConsentModeEnabled = consentModes.google;
-      microsoftConsentModeEnabled = consentModes.microsoft;
-      amazonConsentModeEnabled = consentModes.amazon;
+      consentModel = consentModeData.consentModel;
+      googleConsentModeEnabled = consentModeData.googleEnabled;
+      microsoftConsentModeEnabled = consentModeData.microsoftEnabled;
+      amazonConsentModeEnabled = consentModeData.amazonEnabled;
+
+      if (consentModeData.GoogleConsent) {
+        enabledSdkDetails.GoogleConsent = consentModeData.GoogleConsent;
+      }
+
+      if (consentModeData.MCMData) {
+        enabledSdkDetails.MCMData = consentModeData.MCMData;
+      }
+
+      if (consentModeData.ACMData) {
+        enabledSdkDetails.ACMData = consentModeData.ACMData;
+      }
     } catch {
       googleConsentModeEnabled = null;
       microsoftConsentModeEnabled = null;
       amazonConsentModeEnabled = null;
+      consentModel = "";
+      enabledSdkDetails = {};
     }
+
+    const gtagAndDataLayerState = await page.evaluate(() => {
+      const dataLayer = Array.isArray(window.dataLayer)
+        ? window.dataLayer
+        : [];
+
+      return {
+        hasGtagFunction: typeof window.gtag === "function",
+        hasDataLayer: Array.isArray(window.dataLayer),
+        dataLayer,
+      };
+    });
+
+    const gcmDefaults = evaluateGcmDefaultsFromDataLayer(
+      gtagAndDataLayerState.dataLayer
+    );
+
+    const gtagDetectedBeforeConsent =
+      !optanonAlertBoxClosedExists &&
+      (
+        gtagAndDataLayerState.hasGtagFunction ||
+        googleNetworkRequests.length > 0
+      );
+
+    const gcmMode = evaluateGcmMode({
+      gtagDetectedBeforeConsent,
+      optanonAlertBoxClosedExists,
+    });
+
+    const gcsValues = googleAnalyticsCollectionCalls
+      .map((call) => call.gcs)
+      .filter(Boolean);
+
+    const gaCollectionCallsFound =
+      googleAnalyticsCollectionCalls.length > 0;
+
+    const gaCollectionCallsWithoutGcs =
+      googleAnalyticsCollectionCalls.filter((call) => !call.gcs);
+
+    const gcsValidation = validateGcsDefault({
+      gcsValues,
+      optanonAlertBoxClosedExists,
+      consentModel,
+      location: {
+        country: detectedCountry,
+        state: detectedState,
+      },
+      triggerRuleSet,
+    });
 
     return {
       checkedUrl: targetUrl,
@@ -425,9 +877,14 @@ export async function runCheck(inputUrl, options = {}) {
         SkipGeolocation: skipGeolocation,
       },
 
-      scriptPlacement: {
+      scriptChecks: {
         otSdkStubFound: otSdkStubScripts.length > 0,
         otAutoBlockFound: otAutoBlockScripts.length > 0,
+
+        otCCPAiabFound: otCCPAiabScripts.length > 0,
+        otBannerSdkFound: otBannerSdkScripts.length > 0,
+        otTCFFound: otTCFScripts.length > 0,
+        otGPPFound: otGPPScripts.length > 0,
 
         otSdkStubInHead,
         otAutoBlockInHead,
@@ -445,6 +902,10 @@ export async function runCheck(inputUrl, options = {}) {
           jsScriptsBeforeOneTrust.map((script) => script.src),
       },
 
+      scriptHosting,
+
+      ruleSetSummary,
+
       geolocation: {
         skipped: shouldSkipLocationInfo,
         reason: shouldSkipLocationInfo
@@ -455,17 +916,59 @@ export async function runCheck(inputUrl, options = {}) {
         state: shouldSkipLocationInfo ? "" : detectedState,
       },
 
-      selectedRuleSet: {
-        matched: matchedRuleSet.matched,
-        matchReason: matchedRuleSet.matchReason,
-        matchedRuleIndex: matchedRuleSet.matchedRuleIndex,
-        templateName: matchedRuleSet.templateName,
-      },
+      triggerRuleSet,
 
       consentModes: {
         googleConsentModeEnabled,
         microsoftConsentModeEnabled,
         amazonConsentModeEnabled,
+        enabledSdkDetails,
+      },
+
+      googleConsentModeAudit: {
+        optanonAlertBoxClosedExists,
+        gtagDetectedBeforeConsent,
+
+        hasGtagFunction: gtagAndDataLayerState.hasGtagFunction,
+        hasDataLayer: gtagAndDataLayerState.hasDataLayer,
+
+        inferredMode: gcmMode.inferredMode,
+        inferredModeMessage: gcmMode.message,
+
+        gcmDefaultsFound: gcmDefaults.gcmDefaultsFound,
+        gcmDefaultEntries: gcmDefaults.gcmDefaultEntries,
+
+        gaCollectionCallsFound,
+        gaCollectionCallCount: googleAnalyticsCollectionCalls.length,
+
+        gcsParameterFound: gcsValues.length > 0,
+        gcsValues: [...new Set(gcsValues)],
+
+        gaCollectionCallsWithoutGcsCount:
+          gaCollectionCallsWithoutGcs.length,
+
+        gaCollectionCallsWithoutGcs:
+          gaCollectionCallsWithoutGcs.map((call) => call.url),
+
+        consentModel,
+
+        defaultValidationStatus: gcsValidation.status,
+        defaultValidationMessage: gcsValidation.message,
+
+        location: {
+          country: detectedCountry,
+          state: detectedState,
+        },
+
+        triggerRuleSet: {
+          matched: triggerRuleSet.matched,
+          matchedRuleIndex: triggerRuleSet.matchedRuleIndex,
+          Name: triggerRuleSet.Name,
+          TemplateName: triggerRuleSet.TemplateName,
+          Type: triggerRuleSet.Type,
+          GCEnable: triggerRuleSet.GCEnable,
+          IsGPPEnabled: triggerRuleSet.IsGPPEnabled,
+        },
       },
     };
   } finally {
