@@ -1,6 +1,7 @@
 import { chromium } from "playwright";
 
-function normal();function normaliseUrl(url) {
+function normaliseUrl(url) {
+  const trimmed = (url || "").trim();
   if (!trimmed) return "";
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
@@ -85,7 +86,6 @@ export async function runCheck(inputUrl) {
     const checkedHost = new URL(targetUrl).hostname || "";
     const configDomain = capturedConfig?.Domain ?? "";
 
-    // ✅ FIXED: ALWAYS BOOLEAN (no nulls, no undefined)
     let domainScopeValid = false;
     let domainOutOfScope = false;
 
@@ -103,7 +103,6 @@ export async function runCheck(inputUrl) {
       domainOutOfScope = false;
     }
 
-    // ✅ EXTRA GUARANTEE (critical for Copilot)
     domainScopeValid = Boolean(domainScopeValid);
     domainOutOfScope = Boolean(domainOutOfScope);
 
