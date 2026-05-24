@@ -1,7 +1,10 @@
 name: Run Agent.js Test
 
 on:
-  workflow        description: "Website URL to test"  workflow_dispatch:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website URL to test"
         required: true
         default: "https://example.com"
 
@@ -32,5 +35,3 @@ jobs:
             console.log(JSON.stringify(result, null, 2));
           });
           "
-    inputs:
-      url:
