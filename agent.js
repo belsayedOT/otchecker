@@ -54,6 +54,37 @@ function normaliseConsentModel(consentModel) {
 const EXPECTED_WORKFLOW_VERSION_REGEX = /\b(?:202[3-9]|20[3-9]\d)(?:0[1-9]|1[0-2])\.[12]\.0\b/;
 const LATEST_AVAILABLE_WORKFLOW_VERSION = "2026.05.0";
 
+function parseSemverVersion(version) {
+  const match = /^([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(
+    String(version || "").trim()
+  );
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function getExpectedWorkflowVersionAgeMonths(version) {
+  const match = /^([0-9]{4})\.(0[1-9]|1[0-2])\.[12]\.0$/.exec(
+    String(version || "").trim()
+  );
+
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const versionDate = new Date(year, month - 1, 1);
+  const now = new Date();
+
+  return (
+    (now.getFullYear() - versionDate.getFullYear()) * 12 +
+    now.getMonth() -
+    versionDate.getMonth()
+  );
+}
+
 function toArray(value) {
   if (!value) return [];
 
@@ -710,11 +741,16 @@ export async function runCheck(inputUrl, options = {}) {
         ? Math.min(...oneTrustScripts.map((script) => script.index))
         : null;
 
+    const firstOtautoblockScriptIndex =
+      otAutoBlockScripts.length > 0
+        ? Math.min(...otAutoBlockScripts.map((script) => script.index))
+        : null;
+
     const jsScriptsBeforeOneTrust =
       firstOneTrustScriptIndex === null
         ? []
         : scripts.filter((script) => {
-            const src = script.src.toLowerCase();
+            const src = String(script.src || "").toLowerCase();
 
             return (
               script.index < firstOneTrustScriptIndex &&
@@ -722,6 +758,35 @@ export async function runCheck(inputUrl, options = {}) {
               src.includes(".js")
             );
           });
+
+    const excludedAdsConsentFrameworks = [
+      "otccpaiab.js",
+      "otgpp.js",
+      "otbannersdk.js",
+      "ottcf.js",
+    ];
+
+    const adsConsentFrameworkScripts =
+      firstOtautoblockScriptIndex === null
+        ? []
+        : scripts.filter((script) => {
+            const src = String(script.src || "").toLowerCase();
+
+            return (
+              script.index < firstOtautoblockScriptIndex &&
+              src &&
+              src.includes(".js") &&
+              !excludedAdsConsentFrameworks.some((excluded) =>
+                src.includes(excluded)
+              )
+            );
+          });
+
+    const adsConsentFrameworksBeforeAutoBlock = {
+      found: adsConsentFrameworkScripts.length > 0,
+      count: adsConsentFrameworkScripts.length,
+      urls: adsConsentFrameworkScripts.map((script) => script.src),
+    };
 
     const otSdkStubInHead = otSdkStubScripts.some((script) => script.inHead);
     const otAutoBlockInHead = otAutoBlockScripts.some((script) => script.inHead);
@@ -752,18 +817,41 @@ export async function runCheck(inputUrl, options = {}) {
     const ruleSetSummary = summariseRuleSet(ruleSet);
 
     const versionValue = capturedUdidJson?.Version ?? "";
-    const versionMatches = EXPECTED_WORKFLOW_VERSION_REGEX.test(versionValue);
+    const numericVersion = parseSemverVersion(versionValue);
+    const isLegacyWorkflow =
+      numericVersion &&
+      (numericVersion.major < 6 ||
+        (numericVersion.major === 6 && numericVersion.minor < 30));
+    const versionAgeMonths = getExpectedWorkflowVersionAgeMonths(versionValue);
+    const isExpectedVersion = EXPECTED_WORKFLOW_VERSION_REGEX.test(versionValue);
+    const isMoreThanOneYearOld =
+      versionAgeMonths !== null && versionAgeMonths > 12;
+
+    const displayVersion = isLegacyWorkflow
+      ? "6.6.0 (old workflow)"
+      : versionValue;
+
     const versionCheck = {
       version: versionValue,
-      isVersionSupported: versionMatches,
+      displayVersion,
+      isVersionSupported:
+        Boolean(versionValue) && isExpectedVersion && !isMoreThanOneYearOld,
       latestAvailableVersion: LATEST_AVAILABLE_WORKFLOW_VERSION,
       status: versionValue
-        ? versionMatches
-          ? "SUPPORTED"
+        ? isLegacyWorkflow
+          ? "OUT_OF_DATE"
+          : isExpectedVersion
+          ? isMoreThanOneYearOld
+            ? "UPGRADE_RECOMMENDED"
+            : "SUPPORTED"
           : "OUT_OF_DATE"
         : "UNKNOWN",
-      warning: versionValue && !versionMatches
-        ? "High level warning: the banner is out of date and using an old workflow version. Recommend upgrading the banner to the latest available version."
+      warning: versionValue
+        ? isLegacyWorkflow
+          ? "High level warning: the banner is out of date and using old workflow version. Recommend upgrading the banner to the latest available version."
+          : isExpectedVersion && isMoreThanOneYearOld
+          ? "High level warning: the banner workflow version is more than one year old. Recommend upgrading to the latest available version."
+          : ""
         : "",
     };
 
@@ -1039,6 +1127,12 @@ export async function runCheck(inputUrl, options = {}) {
 
         jsFilesBeforeOneTrustList:
           jsScriptsBeforeOneTrust.map((script) => script.src),
+
+        adsConsentFrameworksBeforeAutoBlock: {
+          found: adsConsentFrameworksBeforeAutoBlock.found,
+          count: adsConsentFrameworksBeforeAutoBlock.count,
+          urls: adsConsentFrameworksBeforeAutoBlock.urls,
+        },
       },
 
       scriptHosting,
