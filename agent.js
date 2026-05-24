@@ -364,6 +364,13 @@ function getCookieByName(cookies, name) {
   return cookies.find((cookie) => lower(cookie.name) === target) || null;
 }
 
+function getCookieNamesByPrefix(cookies, prefix) {
+  const target = lower(prefix);
+  return cookies
+    .filter((cookie) => lower(cookie.name).startsWith(target))
+    .map((cookie) => cookie.name);
+}
+
 function extractQueryParam(url, paramName) {
   try {
     const parsed = new URL(url);
@@ -616,9 +623,23 @@ export async function runCheck(inputUrl, options = {}) {
 
     await page.waitForTimeout(pageLoadWaitMs);
 
+    const oneTrustApiState = await page.evaluate(() => ({
+      oneTrustGlobalFound: typeof window.OneTrust === "object",
+      getDomainDataAvailable:
+        typeof window.OneTrust?.GetDomainData === "function",
+      getGeolocationDataAvailable:
+        typeof window.OneTrust?.getGeolocationData === "function",
+    }));
+
     const finalUrl = page.url();
 
     const cookies = await context.cookies();
+    const optanonConsentCookie = getCookieByName(cookies, "OptanonConsent");
+    const optanonActiveGroupsCookie = getCookieByName(
+      cookies,
+      "OptanonActiveGroups"
+    );
+    const optanonCookieNames = getCookieNamesByPrefix(cookies, "optanon");
     const optanonAlertBoxClosedCookie = getCookieByName(
       cookies,
       "OptanonAlertBoxClosed"
@@ -674,6 +695,13 @@ export async function runCheck(inputUrl, options = {}) {
     const scriptHosting = {
       otSdkStub: classifyScriptHosting(otSdkStubPrimaryUrl, finalUrl),
       otAutoBlock: classifyScriptHosting(otAutoBlockPrimaryUrl, finalUrl),
+    };
+
+    const cookieAudit = {
+      optanonConsentExists: Boolean(optanonConsentCookie),
+      optanonActiveGroupsExists: Boolean(optanonActiveGroupsCookie),
+      optanonAlertBoxClosedExists: Boolean(optanonAlertBoxClosedCookie),
+      optanonCookieNames,
     };
 
     const ruleSet = Array.isArray(capturedUdidJson?.RuleSet)
@@ -948,6 +976,15 @@ export async function runCheck(inputUrl, options = {}) {
       },
 
       scriptHosting,
+
+      cookieAudit,
+
+      oneTrustApiChecks: {
+        oneTrustGlobalFound: oneTrustApiState.oneTrustGlobalFound,
+        getDomainDataAvailable: oneTrustApiState.getDomainDataAvailable,
+        getGeolocationDataAvailable: oneTrustApiState.getGeolocationDataAvailable,
+        dataLayerEventCount: gtagAndDataLayerState.dataLayer.length,
+      },
 
       ruleSetSummary,
 
