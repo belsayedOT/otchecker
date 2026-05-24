@@ -1,7 +1,10 @@
 import { chromium } from "playwright";
 
-function normaliseUrlSeverity(findings) {function normaliseUrl(url) {
-  if (findings.some(f => f.severity === "HIGH")) return "HIGH";
+/* -------------------------
+   Helpers
+-------------------------- */
+
+ "HIGH";function normaliseUrl(url) {
   if (findings.some(f => f.severity === "MEDIUM")) return "MEDIUM";
   if (findings.length > 0) return "LOW";
   return "NONE";
@@ -35,8 +38,6 @@ function toList(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.map(v => String(v).trim()).filter(Boolean);
 
-  // some payloads store lists as space-separated strings
-  // e.g. "us ca gb" or "us,ca,gb"
   if (typeof value === "string") {
     return value
       .split(/[\s,;]+/g)
@@ -51,6 +52,12 @@ function lowerList(value) {
   return toList(value).map(v => v.toLowerCase());
 }
 
+/**
+ * Template selection logic (your requirements)
+ * - Must match country
+ * - States can be empty => wildcard
+ * - Prefer exact state match when present
+ */
 function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
   const country = (geoCountry || "").toLowerCase().trim();
   const state = (geoState || "").toLowerCase().trim();
@@ -63,38 +70,34 @@ function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
     return { templateName: "", matchType: "no_geo_country", matchedIndex: -1, matchedRule: null };
   }
 
-  // Find best match:
-  // - must match country
-  // - if States empty => wildcard match
-  // - if States has values => must match state to be "state-specific"
   let best = null;
 
   for (let i = 0; i < ruleSet.length; i++) {
     const r = ruleSet[i] || {};
+
     const countries = lowerList(r.Countries ?? r.countries);
+    // States might be [], "", null, or string list
     const states = lowerList(r.States ?? r.states);
 
-    const countryMatch = countries.includes(country);
-    if (!countryMatch) continue;
+    if (!countries.includes(country)) continue;
 
     const hasStateList = states.length > 0;
-    const wildcardState = !hasStateList; // empty means applies to any state
     const exactStateMatch = hasStateList && state && states.includes(state);
+    const wildcardState = !hasStateList; // empty => applies to any state
 
-    // If state is present but doesn't match state list, skip
-    if (hasStateList && state && !exactStateMatch) continue;
-
-    // If state is empty (geolocation didn’t provide it), prefer wildcardState rules
+    // if rule expects a state but geo state is empty -> cannot match this rule
     if (hasStateList && !state) continue;
 
-    // scoring: prefer exact state match over wildcard
+    // if state present but not in rule state list -> cannot match
+    if (hasStateList && state && !exactStateMatch) continue;
+
     const score = exactStateMatch ? 3 : 2; // both already match country
 
     const candidate = {
       matchedIndex: i,
       matchedRule: r,
       templateName: r.TemplateName ?? "",
-      matchType: exactStateMatch ? "country_and_state" : "country_only_or_wildcard_state",
+      matchType: exactStateMatch ? "country_and_state" : (wildcardState ? "country_and_wildcard_state" : "country_only"),
       score
     };
 
@@ -108,8 +111,12 @@ function resolveTemplateFromRuleSet(ruleSet, geoCountry, geoState) {
   return best;
 }
 
-async function runCheck(inputUrl) {
-	const targetUrl = normaliseUrl(inputUrl);
+/* -------------------------
+   Main
+-------------------------- */
+
+export async function runCheck(inputUrl) {
+  const targetUrl = normaliseUrl(inputUrl);
   if (!targetUrl) throw new Error("url is required");
 
   let browser = null;
@@ -118,7 +125,7 @@ async function runCheck(inputUrl) {
   let capturedConfig = null;
   let capturedConfigUrl = "";
 
-  let isCspBlocked = false; // reserved
+  let isCspBlocked = false; // reserved for later
   let accessDenied = false;
   let navigationError = null;
 
@@ -126,14 +133,13 @@ async function runCheck(inputUrl) {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
 
+    // Capture udid.json-like payloads
     page.on("response", async response => {
       try {
         const status = response.status();
-        const req = response.request();
-        const resourceType = req.resourceType();
         const url = response.url();
 
-        if (resourceType === "document" && (status === 401 || status === 403)) {
+        if (response.request().resourceType() === "document" && (status === 401 || status === 403)) {
           accessDenied = true;
         }
 
@@ -164,6 +170,7 @@ async function runCheck(inputUrl) {
       } catch {}
     });
 
+    // Navigate
     let navigationResponse = null;
     try {
       navigationResponse = await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
@@ -189,14 +196,12 @@ async function runCheck(inputUrl) {
 
     if (navigationResponse) {
       const status = navigationResponse.status();
-      if (status === 401 || status === 403) {
-        accessDenied = true;
-      }
+      if (status === 401 || status === 403) accessDenied = true;
     }
 
     await page.waitForTimeout(5000);
 
-    // script scan
+    // Script scan
     const scripts = await page.locator("script").evaluateAll(nodes =>
       nodes.map((s, idx) => ({
         index: idx,
@@ -241,12 +246,12 @@ async function runCheck(inputUrl) {
     const hasDuplicateOtSdkStub = stubScripts.length > 1;
     const hasDuplicateAutoBlock = autoBlockScripts.length > 1;
 
-    // udid.json fields
+    // RuleSet / SkipGeolocation
     const ruleSet = Array.isArray(capturedConfig?.RuleSet) ? capturedConfig.RuleSet : [];
     const ruleSetCount = ruleSet.length;
     const skipGeolocation = Boolean(capturedConfig?.SkipGeolocation);
 
-    // ---- NEW TEMPLATE RESOLUTION LOGIC ----
+    // ---- TEMPLATE RESOLUTION (your new logic) ----
     let geoCountry = "";
     let geoState = "";
     let resolvedTemplateName = "";
@@ -260,7 +265,6 @@ async function runCheck(inputUrl) {
         templateName: resolvedTemplateName
       };
     } else {
-      // capture OneTrust.getGeolocationData().country/state
       try {
         await page.waitForFunction(
           () => window.OneTrust && typeof window.OneTrust.getGeolocationData === "function",
@@ -294,28 +298,22 @@ async function runCheck(inputUrl) {
       };
     }
 
-    // findings
+    // Findings / severity
     const issues = [];
     const recommendations = [];
 
     if (accessDenied) {
       issues.push(mkFinding("HIGH", "Access denied or blocked (401/403 or page content detected)"));
     }
-
     if (domainOutOfScope) {
-      issues.push(
-        mkFinding("HIGH", `Domain mismatch between script and site (${configDomain} vs ${checkedHost})`)
-      );
+      issues.push(mkFinding("HIGH", `Domain mismatch between script and site (${configDomain} vs ${checkedHost})`));
     }
-
     if (!otSDKStubFound) {
       issues.push(mkFinding("HIGH", "otSDKStub.js not detected"));
     }
-
     if (hasDuplicateOtSdkStub) {
       issues.push(mkFinding("HIGH", "Duplicate otSDKStub.js detected"));
     }
-
     if (hasDuplicateAutoBlock) {
       issues.push(mkFinding("MEDIUM", "Duplicate otAutoBlock.js detected"));
     }
@@ -392,7 +390,4 @@ function mkFinding(severity, message) {
   return { severity, message };
 }
 
-
-module.exports = { runCheck };
-
-
+function computeSeverity(findings) {
