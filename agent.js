@@ -446,6 +446,33 @@ function isGoogleAnalyticsCollectionUrl(url) {
   );
 }
 
+function isAmazonAdsUrl(url) {
+  const value = lower(url);
+
+  return (
+    value.includes("amazon-adsystem.com") ||
+    value.includes("amazon-adsystem") ||
+    value.includes("amazon-adsystem") ||
+    value.includes("amazon-adsystem") ||
+    value.includes("amazon-adsystem.com") ||
+    value.includes("amazon-adsystem") ||
+    value.includes("amzn.to") ||
+    value.includes("amazon-adsystem") ||
+    value.includes("amazon") && value.includes("-adsystem")
+  );
+}
+
+function isMicrosoftAdsUrl(url) {
+  const value = lower(url);
+
+  return (
+    value.includes("bat.bing.com") ||
+    value.includes("bing.com") ||
+    value.includes("bingads") ||
+    value.includes("bingpixel")
+  );
+}
+
 function evaluateGcmDefaultsFromDataLayer(dataLayer) {
   const entries = Array.isArray(dataLayer) ? dataLayer : [];
 
@@ -572,6 +599,10 @@ export async function runCheck(inputUrl, options = {}) {
 
   const googleNetworkRequests = [];
   const googleAnalyticsCollectionCalls = [];
+  const amazonNetworkRequests = [];
+  const amazonCollectionCalls = [];
+  const microsoftNetworkRequests = [];
+  const microsoftCollectionCalls = [];
 
   if (!targetUrl) {
     return {
@@ -612,6 +643,36 @@ export async function runCheck(inputUrl, options = {}) {
             gcs: extractQueryParam(url, "gcs"),
             gcd: extractQueryParam(url, "gcd"),
           });
+        }
+
+        // Amazon request capture (common ad endpoints and /collect patterns)
+        if (isAmazonAdsUrl(url)) {
+          amazonNetworkRequests.push({
+            url,
+            resourceType: request.resourceType(),
+            method: request.method(),
+            npa: extractQueryParam(url, "npa"),
+            consent: extractQueryParam(url, "consent"),
+          });
+
+          if (url.toLowerCase().includes("/collect") || url.toLowerCase().includes("collect")) {
+            amazonCollectionCalls.push({ url, resourceType: request.resourceType(), method: request.method() });
+          }
+        }
+
+        // Microsoft / Bing request capture
+        if (isMicrosoftAdsUrl(url)) {
+          microsoftNetworkRequests.push({
+            url,
+            resourceType: request.resourceType(),
+            method: request.method(),
+            consent: extractQueryParam(url, "consent"),
+            gdpr: extractQueryParam(url, "gdpr"),
+          });
+
+          if (url.toLowerCase().includes("/collect") || url.toLowerCase().includes("bat.bing.com")) {
+            microsoftCollectionCalls.push({ url, resourceType: request.resourceType(), method: request.method() });
+          }
         }
       } catch {
         // Continue scan.
@@ -799,6 +860,7 @@ export async function runCheck(inputUrl, options = {}) {
       "otgpp.js",
       "otbannersdk.js",
       "ottcf.js",
+      "otsdkstub",
     ];
 
     const adsConsentFrameworkScripts =
@@ -822,6 +884,15 @@ export async function runCheck(inputUrl, options = {}) {
       count: adsConsentFrameworkScripts.length,
       urls: adsConsentFrameworkScripts.map((script) => script.src),
     };
+
+    const gtmBeforeAutoBlock = jsScriptsBeforeOneTrust.some((s) => {
+      const src = String(s.src || "").toLowerCase();
+      return src.includes("gtm.js") || src.includes("googletagmanager.com/gtm.js");
+    });
+
+    const gtmBeforeAutoBlockRecommendation = gtmBeforeAutoBlock
+      ? "Low risk: GTM loads before OneTrust autoblock. Consider using GTM blocking in GTM rather than otautoblock.js."
+      : "";
 
     const otSdkStubInHead = otSdkStubScripts.some((script) => script.inHead);
     const otAutoBlockInHead = otAutoBlockScripts.some((script) => script.inHead);
@@ -1128,6 +1199,42 @@ export async function runCheck(inputUrl, options = {}) {
       triggerRuleSet,
     });
 
+      // Amazon consent mode audit
+      const amazonParamValues = [
+        ...new Set(
+          amazonNetworkRequests
+            .map((r) => r.npa || r.consent)
+            .filter(Boolean)
+        ),
+      ];
+
+      const amazonConsentModeAudit = {
+        detected: amazonNetworkRequests.length > 0 || amazonCollectionCalls.length > 0 || amazonConsentModeEnabled,
+        collectionCallsDetected: amazonCollectionCalls.length > 0,
+        collectionCallUrls: amazonCollectionCalls.map((c) => c.url),
+        parameterFound: amazonParamValues.length > 0,
+        parameterValues: amazonParamValues,
+        networkRequestCount: amazonNetworkRequests.length,
+      };
+
+      // Microsoft consent mode audit
+      const microsoftParamValues = [
+        ...new Set(
+          microsoftNetworkRequests
+            .map((r) => r.consent || r.gdpr)
+            .filter(Boolean)
+        ),
+      ];
+
+      const microsoftConsentModeAudit = {
+        detected: microsoftNetworkRequests.length > 0 || microsoftCollectionCalls.length > 0 || microsoftConsentModeEnabled,
+        collectionCallsDetected: microsoftCollectionCalls.length > 0,
+        collectionCallUrls: microsoftCollectionCalls.map((c) => c.url),
+        parameterFound: microsoftParamValues.length > 0,
+        parameterValues: microsoftParamValues,
+        networkRequestCount: microsoftNetworkRequests.length,
+      };
+
     return {
       checkedUrl: targetUrl,
       finalUrl,
@@ -1191,6 +1298,8 @@ export async function runCheck(inputUrl, options = {}) {
           count: adsConsentFrameworksBeforeAutoBlock.count,
           urls: adsConsentFrameworksBeforeAutoBlock.urls,
         },
+        gtmBeforeAutoBlock,
+        gtmBeforeAutoBlockRecommendation,
       },
 
       scriptHosting,
@@ -1280,6 +1389,8 @@ export async function runCheck(inputUrl, options = {}) {
           IsGPPEnabled: triggerRuleSet.IsGPPEnabled,
         },
       },
+      amazonConsentModeAudit: amazonConsentModeAudit,
+      microsoftConsentModeAudit: microsoftConsentModeAudit,
     };
   } finally {
     if (context) await context.close().catch(() => {});
