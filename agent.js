@@ -408,7 +408,17 @@ function getCookieNamesByPrefix(cookies, prefix) {
 function extractQueryParam(url, paramName) {
   try {
     const parsed = new URL(url);
-    return parsed.searchParams.get(paramName);
+    const exact = parsed.searchParams.get(paramName);
+    if (exact !== null) return exact;
+
+    const lowerName = lower(paramName);
+    for (const [key, value] of parsed.searchParams.entries()) {
+      if (lower(key) === lowerName) {
+        return value;
+      }
+    }
+
+    return null;
   } catch {
     return null;
   }
@@ -430,7 +440,9 @@ function isGoogleAnalyticsCollectionUrl(url) {
 
   return (
     value.includes("google-analytics.com/g/collect") ||
-    value.includes("google-analytics.com/collect")
+    value.includes("google-analytics.com/collect") ||
+    value.includes("/g/collect") ||
+    (value.includes("tid=g-") && value.includes("gtm="))
   );
 }
 
