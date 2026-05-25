@@ -1116,8 +1116,12 @@ export async function runCheck(inputUrl, options = {}) {
             microsoftEnabled: null,
             amazonEnabled: null,
             GoogleConsent: null,
+            GoogleConsentRaw: null,
             MCMData: null,
             ACMData: null,
+            MCMDataRaw: null,
+            ACMDataRaw: null,
+            Groups: [],
           };
         }
       });
