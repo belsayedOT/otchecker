@@ -1104,6 +1104,10 @@ export async function runCheck(inputUrl, options = {}) {
               data?.ACMData?.Enabled === true
                 ? data?.ACMData
                 : null,
+
+            // Always capture raw data for misconfiguration detection
+            MCMDataRaw: data?.MCMData ?? null,
+            ACMDataRaw: data?.ACMData ?? null,
           };
         } catch {
           return {
@@ -1199,7 +1203,7 @@ export async function runCheck(inputUrl, options = {}) {
       triggerRuleSet,
     });
 
-      // Amazon consent mode audit
+      // Amazon consent mode audit (enhanced with validation)
       const amazonParamValues = [
         ...new Set(
           amazonNetworkRequests
@@ -1208,16 +1212,30 @@ export async function runCheck(inputUrl, options = {}) {
         ),
       ];
 
+      const amazonConsentValidation = validateAcmConfiguration({
+        acmDataRaw: consentModeData.ACMDataRaw,
+        amazonNetworkRequests,
+        amazonCollectionCalls,
+        groups: consentModeData.Groups,
+      });
+
       const amazonConsentModeAudit = {
-        detected: amazonNetworkRequests.length > 0 || amazonCollectionCalls.length > 0 || amazonConsentModeEnabled,
+        detected: amazonConsentValidation.detected,
+        acmEnabled: amazonConsentValidation.acmEnabled,
+        requestsExist: amazonConsentValidation.requestsExist,
         collectionCallsDetected: amazonCollectionCalls.length > 0,
         collectionCallUrls: amazonCollectionCalls.map((c) => c.url),
         parameterFound: amazonParamValues.length > 0,
         parameterValues: amazonParamValues,
         networkRequestCount: amazonNetworkRequests.length,
+        configurationWarning: amazonConsentValidation.configurationWarning,
+        storageTypesCategoriesValid: amazonConsentValidation.storageTypesCategoriesValid,
+        categoriesWithoutCookies: amazonConsentValidation.categoriesWithoutCookies,
+        validationStatus: amazonConsentValidation.validationStatus,
+        validationMessage: amazonConsentValidation.validationMessage,
       };
 
-      // Microsoft consent mode audit
+      // Microsoft consent mode audit (enhanced with validation)
       const microsoftParamValues = [
         ...new Set(
           microsoftNetworkRequests
@@ -1226,13 +1244,27 @@ export async function runCheck(inputUrl, options = {}) {
         ),
       ];
 
+      const microsoftConsentValidation = validateMcmConfiguration({
+        mcmDataRaw: consentModeData.MCMDataRaw,
+        microsoftNetworkRequests,
+        microsoftCollectionCalls,
+        groups: consentModeData.Groups,
+      });
+
       const microsoftConsentModeAudit = {
-        detected: microsoftNetworkRequests.length > 0 || microsoftCollectionCalls.length > 0 || microsoftConsentModeEnabled,
+        detected: microsoftConsentValidation.detected,
+        mcmEnabled: microsoftConsentValidation.mcmEnabled,
+        requestsExist: microsoftConsentValidation.requestsExist,
         collectionCallsDetected: microsoftCollectionCalls.length > 0,
         collectionCallUrls: microsoftCollectionCalls.map((c) => c.url),
         parameterFound: microsoftParamValues.length > 0,
         parameterValues: microsoftParamValues,
         networkRequestCount: microsoftNetworkRequests.length,
+        configurationWarning: microsoftConsentValidation.configurationWarning,
+        storageTypesCategoriesValid: microsoftConsentValidation.storageTypesCategoriesValid,
+        categoriesWithoutCookies: microsoftConsentValidation.categoriesWithoutCookies,
+        validationStatus: microsoftConsentValidation.validationStatus,
+        validationMessage: microsoftConsentValidation.validationMessage,
       };
 
     return {
@@ -1396,6 +1428,192 @@ export async function runCheck(inputUrl, options = {}) {
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
   }
+}
+
+// Validate Amazon Consent Mode (ACM) configuration
+function validateAcmConfiguration({
+  acmDataRaw,
+  amazonNetworkRequests,
+  amazonCollectionCalls,
+  groups,
+}) {
+  const acmEnabled = acmDataRaw?.Enabled === true;
+  const amazonRequestsExist = amazonNetworkRequests.length > 0 || amazonCollectionCalls.length > 0;
+
+  // Critical: Amazon requests detected but ACM disabled
+  if (!acmEnabled && amazonRequestsExist) {
+    return {
+      acmEnabled: false,
+      detected: true,
+      requestsExist: amazonRequestsExist,
+      configurationWarning: "⚠️ CRITICAL: Amazon Consent Mode is disabled but Amazon requests detected. Enable Amazon Consent Mode in OneTrust to manage consent properly.",
+      storageTypesCategoriesValid: null,
+      categoriesWithoutCookies: [],
+      validationStatus: "DISABLED_BUT_ACTIVE",
+      validationMessage: "Amazon requests are active but consent mode is not enabled.",
+    };
+  }
+
+  // OK: ACM disabled and no requests
+  if (!acmEnabled && !amazonRequestsExist) {
+    return {
+      acmEnabled: false,
+      detected: false,
+      requestsExist: false,
+      configurationWarning: null,
+      storageTypesCategoriesValid: null,
+      categoriesWithoutCookies: [],
+      validationStatus: "NOT_CONFIGURED",
+      validationMessage: "Amazon Consent Mode is not configured and no Amazon requests detected.",
+    };
+  }
+
+  // ACM enabled: Validate storage type mappings against Groups
+  if (acmEnabled) {
+    const storageTypeMappings = acmDataRaw?.StorageTypes || acmDataRaw?.storage_types || [];
+    const groupNames = Array.isArray(groups) ? groups.map((g) => g.Name || g.name || "") : [];
+    
+    const categoriesWithoutCookies = [];
+    let storageTypesCategoriesValid = true;
+
+    // Check each storage type mapping for category existence and cookie linkage
+    if (Array.isArray(storageTypeMappings)) {
+      storageTypeMappings.forEach((mapping) => {
+        const categoryName = mapping.Name || mapping.name || mapping.Category || mapping.category || "";
+        if (categoryName) {
+          const categoryExists = groupNames.some((name) => lower(name) === lower(categoryName));
+          if (!categoryExists) {
+            storageTypesCategoriesValid = false;
+            categoriesWithoutCookies.push(`${categoryName} (not found in groups)`);
+          } else {
+            const group = groups.find((g) => lower(g.Name || g.name || "") === lower(categoryName));
+            const hasCookies = group?.Cookies && Array.isArray(group.Cookies) && group.Cookies.length > 0;
+            if (!hasCookies) {
+              storageTypesCategoriesValid = false;
+              categoriesWithoutCookies.push(`${categoryName} (no cookies linked)`);
+            }
+          }
+        }
+      });
+    }
+
+    return {
+      acmEnabled: true,
+      detected: amazonRequestsExist,
+      requestsExist: amazonRequestsExist,
+      configurationWarning: null,
+      storageTypesCategoriesValid,
+      categoriesWithoutCookies,
+      validationStatus: storageTypesCategoriesValid ? "PROPERLY_CONFIGURED" : "MISCONFIGURED",
+      validationMessage: storageTypesCategoriesValid
+        ? "Amazon Consent Mode is properly configured with valid storage type categories."
+        : `Amazon Consent Mode has configuration issues: ${categoriesWithoutCookies.join("; ")}`,
+    };
+  }
+
+  return {
+    acmEnabled: false,
+    detected: false,
+    requestsExist: false,
+    configurationWarning: null,
+    storageTypesCategoriesValid: null,
+    categoriesWithoutCookies: [],
+    validationStatus: "UNKNOWN",
+    validationMessage: "Unable to determine Amazon Consent Mode configuration.",
+  };
+}
+
+// Validate Microsoft Consent Mode (MCM) configuration
+function validateMcmConfiguration({
+  mcmDataRaw,
+  microsoftNetworkRequests,
+  microsoftCollectionCalls,
+  groups,
+}) {
+  const mcmEnabled = mcmDataRaw?.Enabled === true;
+  const microsoftRequestsExist = microsoftNetworkRequests.length > 0 || microsoftCollectionCalls.length > 0;
+
+  // Critical: Microsoft requests detected but MCM disabled
+  if (!mcmEnabled && microsoftRequestsExist) {
+    return {
+      mcmEnabled: false,
+      detected: true,
+      requestsExist: microsoftRequestsExist,
+      configurationWarning: "⚠️ CRITICAL: Microsoft Consent Mode is disabled but Microsoft UET requests detected. Enable Microsoft Consent Mode in OneTrust to manage consent properly.",
+      storageTypesCategoriesValid: null,
+      categoriesWithoutCookies: [],
+      validationStatus: "DISABLED_BUT_ACTIVE",
+      validationMessage: "Microsoft requests are active but consent mode is not enabled.",
+    };
+  }
+
+  // OK: MCM disabled and no requests
+  if (!mcmEnabled && !microsoftRequestsExist) {
+    return {
+      mcmEnabled: false,
+      detected: false,
+      requestsExist: false,
+      configurationWarning: null,
+      storageTypesCategoriesValid: null,
+      categoriesWithoutCookies: [],
+      validationStatus: "NOT_CONFIGURED",
+      validationMessage: "Microsoft Consent Mode is not configured and no Microsoft requests detected.",
+    };
+  }
+
+  // MCM enabled: Validate storage type mappings against Groups
+  if (mcmEnabled) {
+    const storageTypeMappings = mcmDataRaw?.StorageTypes || mcmDataRaw?.storage_types || [];
+    const groupNames = Array.isArray(groups) ? groups.map((g) => g.Name || g.name || "") : [];
+    
+    const categoriesWithoutCookies = [];
+    let storageTypesCategoriesValid = true;
+
+    // Check each storage type mapping for category existence and cookie linkage
+    if (Array.isArray(storageTypeMappings)) {
+      storageTypeMappings.forEach((mapping) => {
+        const categoryName = mapping.Name || mapping.name || mapping.Category || mapping.category || "";
+        if (categoryName) {
+          const categoryExists = groupNames.some((name) => lower(name) === lower(categoryName));
+          if (!categoryExists) {
+            storageTypesCategoriesValid = false;
+            categoriesWithoutCookies.push(`${categoryName} (not found in groups)`);
+          } else {
+            const group = groups.find((g) => lower(g.Name || g.name || "") === lower(categoryName));
+            const hasCookies = group?.Cookies && Array.isArray(group.Cookies) && group.Cookies.length > 0;
+            if (!hasCookies) {
+              storageTypesCategoriesValid = false;
+              categoriesWithoutCookies.push(`${categoryName} (no cookies linked)`);
+            }
+          }
+        }
+      });
+    }
+
+    return {
+      mcmEnabled: true,
+      detected: microsoftRequestsExist,
+      requestsExist: microsoftRequestsExist,
+      configurationWarning: null,
+      storageTypesCategoriesValid,
+      categoriesWithoutCookies,
+      validationStatus: storageTypesCategoriesValid ? "PROPERLY_CONFIGURED" : "MISCONFIGURED",
+      validationMessage: storageTypesCategoriesValid
+        ? "Microsoft Consent Mode is properly configured with valid storage type categories."
+        : `Microsoft Consent Mode has configuration issues: ${categoriesWithoutCookies.join("; ")}`,
+    };
+  }
+
+  return {
+    mcmEnabled: false,
+    detected: false,
+    requestsExist: false,
+    configurationWarning: null,
+    storageTypesCategoriesValid: null,
+    categoriesWithoutCookies: [],
+    validationStatus: "UNKNOWN",
+    validationMessage: "Unable to determine Microsoft Consent Mode configuration.",
+  };
 }
 
 export default runCheck;
