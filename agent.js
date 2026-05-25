@@ -1047,6 +1047,20 @@ export async function runCheck(inputUrl, options = {}) {
     let consentModel = "";
     let enabledSdkDetails = {};
 
+    let consentModeData = {
+      consentModel: "",
+      googleEnabled: null,
+      microsoftEnabled: null,
+      amazonEnabled: null,
+      GoogleConsent: null,
+      GoogleConsentRaw: null,
+      MCMData: null,
+      ACMData: null,
+      MCMDataRaw: null,
+      ACMDataRaw: null,
+      Groups: [],
+    };
+
     try {
       await page.waitForFunction(
         () =>
@@ -1055,7 +1069,7 @@ export async function runCheck(inputUrl, options = {}) {
         { timeout: oneTrustTimeoutMs }
       );
 
-      const consentModeData = await page.evaluate(() => {
+      consentModeData = await page.evaluate(() => {
         function normaliseConsentModelInBrowser(consentModel) {
           if (!consentModel) return "";
 
