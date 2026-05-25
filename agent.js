@@ -817,6 +817,16 @@ export async function runCheck(inputUrl, options = {}) {
     const otSdkStubPrimaryUrl = otSdkStubScripts[0]?.src || "";
     const otAutoBlockPrimaryUrl = otAutoBlockScripts[0]?.src || "";
 
+    const otSdkStubUrlHasQuery =
+      otSdkStubPrimaryUrl && otSdkStubPrimaryUrl.includes("?");
+    const cmpTemplateTagDetected = otSdkStubUrlHasQuery;
+    const cmpBannerSetupMethod =
+      otSdkStubScripts.length === 0
+        ? "Unknown"
+        : cmpTemplateTagDetected
+        ? "GTM CMP template tag"
+        : "Normal script";
+
     const scriptHosting = {
       otSdkStub: classifyScriptHosting(otSdkStubPrimaryUrl, finalUrl),
       otAutoBlock: classifyScriptHosting(otAutoBlockPrimaryUrl, finalUrl),
@@ -999,6 +1009,9 @@ export async function runCheck(inputUrl, options = {}) {
                 ? data?.GoogleConsent
                 : null,
 
+            GoogleConsentRaw: data?.GoogleConsent ?? null,
+            Groups: Array.isArray(data?.Groups) ? data.Groups : [],
+
             MCMData:
               data?.MCMData?.Enabled === true
                 ? data?.MCMData
@@ -1057,6 +1070,14 @@ export async function runCheck(inputUrl, options = {}) {
         dataLayer,
       };
     });
+
+    const gtagDetected =
+      gtagAndDataLayerState.hasGtagFunction ||
+      googleNetworkRequests.length > 0;
+    const collectionCallsDetected =
+      googleAnalyticsCollectionCalls.length > 0;
+    const collectionCallsBeforeConsent =
+      !optanonAlertBoxClosedExists && collectionCallsDetected;
 
     const gcmDefaults = evaluateGcmDefaultsFromDataLayer(
       gtagAndDataLayerState.dataLayer
@@ -1197,12 +1218,20 @@ export async function runCheck(inputUrl, options = {}) {
       googleConsentModeAudit: {
         optanonAlertBoxClosedExists,
         gtagDetectedBeforeConsent,
+        gtagDetected,
+        collectionCallsDetected,
+        collectionCallsBeforeConsent,
+        collectionCallUrls: googleAnalyticsCollectionCalls.map((call) => call.url),
 
         hasGtagFunction: gtagAndDataLayerState.hasGtagFunction,
         hasDataLayer: gtagAndDataLayerState.hasDataLayer,
 
         inferredMode: gcmMode.inferredMode,
         inferredModeMessage: gcmMode.message,
+
+        cmpTemplateTagDetected,
+        cmpBannerSetupMethod,
+        cmpTemplateTagUrl: cmpTemplateTagDetected ? otSdkStubPrimaryUrl : "",
 
         gcmDefaultsFound: gcmDefaults.gcmDefaultsFound,
         gcmDefaultEntries: gcmDefaults.gcmDefaultEntries,
