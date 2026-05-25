@@ -51,6 +51,16 @@ function normaliseConsentModel(consentModel) {
   return String(consentModel);
 }
 
+function isConsentModeEnabled(value) {
+  if (value === true || value === "true" || value === 1 || value === "1") {
+    return true;
+  }
+  if (typeof value === "object" && value !== null) {
+    return isConsentModeEnabled(value.Enabled || value.enabled);
+  }
+  return false;
+}
+
 const EXPECTED_WORKFLOW_VERSION_REGEX = /\b(?:202[3-9]|20[3-9]\d)(?:0[1-9]|1[0-2])\.[12]\.0\b/;
 const LATEST_AVAILABLE_WORKFLOW_VERSION = "2026.05.0";
 
@@ -595,6 +605,7 @@ export async function runCheck(inputUrl, options = {}) {
 
   let capturedUdidJson = null;
   let capturedUdidJsonUrl = "";
+  let capturedUdidJsonLastModified = "";
   let accessDenied = false;
 
   const googleNetworkRequests = [];
@@ -702,6 +713,8 @@ export async function runCheck(inputUrl, options = {}) {
         if (looksLikeUdidJson(parsed)) {
           capturedUdidJson = parsed;
           capturedUdidJsonUrl = url;
+          // Capture last-modified header for UDID JSON
+          capturedUdidJsonLastModified = response.headers()["last-modified"] || response.headers()["Last-Modified"] || "";
         }
       } catch {
         // Ignore parsing failures and continue the scan.
@@ -1141,9 +1154,9 @@ export async function runCheck(inputUrl, options = {}) {
       });
 
       consentModel = normaliseConsentModel(consentModeData.consentModel);
-      googleConsentModeEnabled = consentModeData.googleEnabled === true;
-      microsoftConsentModeEnabled = consentModeData.microsoftEnabled === true;
-      amazonConsentModeEnabled = consentModeData.amazonEnabled === true;
+      googleConsentModeEnabled = isConsentModeEnabled(consentModeData.googleEnabled);
+      microsoftConsentModeEnabled = isConsentModeEnabled(consentModeData.microsoftEnabled);
+      amazonConsentModeEnabled = isConsentModeEnabled(consentModeData.amazonEnabled);
 
       if (consentModeData.GoogleConsent) {
         enabledSdkDetails.GoogleConsent = consentModeData.GoogleConsent;
@@ -1308,6 +1321,7 @@ export async function runCheck(inputUrl, options = {}) {
         Id: udidIdValue,
         TenantGuid: udidTenantGuidValue,
         UdidFileNameValue: udidFileNameValue,
+        lastPublishingDate: capturedUdidJsonLastModified,
         isTestScript: isTestUdidScript,
         scriptScopeValid: udidScriptScopeValid,
         scriptScopeMessage: udidScriptScopeMessage,
