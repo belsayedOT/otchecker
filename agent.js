@@ -587,6 +587,66 @@ function validateGcsDefault({
   };
 }
 
+function parseOptanonConsentCookie(cookieValue) {
+  if (!cookieValue) {
+    return {
+      parsed: false,
+      groups: {},
+      dateStamp: "",
+      version: "",
+      interactionCount: 0,
+      consentId: "",
+    };
+  }
+
+  try {
+    const params = new URLSearchParams(cookieValue);
+    const groupsStr = params.get("groups") || "";
+    const groups = {};
+
+    if (groupsStr) {
+      groupsStr.split(",").forEach((item) => {
+        const [groupId, state] = item.split(":");
+        if (groupId && state !== undefined) {
+          groups[`Group ${groupId}`] = state === "1" ? "Accepted" : "Rejected";
+        }
+      });
+    }
+
+    return {
+      parsed: true,
+      groups,
+      dateStamp: params.get("datestamp") || "",
+      version: params.get("version") || "",
+      interactionCount: parseInt(params.get("interactionCount") || "0", 10),
+      consentId: params.get("consentId") || "",
+      isAnonUser: params.get("isAnonUser") === "1",
+    };
+  } catch {
+    return {
+      parsed: false,
+      groups: {},
+      dateStamp: "",
+      version: "",
+      interactionCount: 0,
+      consentId: "",
+    };
+  }
+}
+
+function formatGeolocationDetails(triggered, country, state) {
+  if (!triggered) {
+    return "No";
+  }
+  if (country && state) {
+    return `Yes (${country}, ${state})`;
+  }
+  if (country) {
+    return `Yes (${country})`;
+  }
+  return "Yes";
+}
+
 export async function runCheck(inputUrl, options = {}) {
   const targetUrl = normaliseUrl(inputUrl);
 
@@ -741,11 +801,9 @@ export async function runCheck(inputUrl, options = {}) {
 
     if (navigationError) {
       return {
-        checkedUrl: targetUrl,
         success: false,
-        accessDenied: accessDenied || isFirewallTimeout,
-        error: navigationError,
-        botNotice,
+        access: "No",
+        botNote: botNotice || "🤖 The agent could not reach the website. " + navigationError,
       };
     }
 
@@ -1298,163 +1356,129 @@ export async function runCheck(inputUrl, options = {}) {
         validationMessage: microsoftConsentValidation.validationMessage,
       };
 
+    // Parse OptanonConsent cookie
+    const optanonConsentParsed = parseOptanonConsentCookie(
+      optanonConsentCookie?.value || ""
+    );
+
+    // Get publishing settings
+    const isSuppressBanner = capturedUdidJson?.IsSuppressBanner === true;
+    const isSuppressPC = capturedUdidJson?.IsSuppressPC === true;
+    const bannerRefreshAfterCTA = capturedUdidJson?.BannerRefreshAfterCallToActionEnabled === true;
+
     return {
-      checkedUrl: targetUrl,
-      finalUrl,
       success: true,
-      accessDenied,
+      access: "Yes",
+      testLocation: detectedCountry ? `${detectedCountry}${detectedState ? ", " + detectedState : ""}` : "Not detected",
 
-      udidJsonFound: Boolean(capturedUdidJson),
-      udidJsonUrl: capturedUdidJsonUrl,
+      // URLs
+      checkedUrl: targetUrl,
+      redirectedTo: finalUrl !== targetUrl ? finalUrl : "",
 
-      udidJson: {
-        Version: capturedUdidJson?.Version ?? "",
-        ScriptType: capturedUdidJson?.ScriptType ?? "",
-        LanguageDetectionByHtml:
-          capturedUdidJson?.LanguageDetectionByHtml ?? "",
-        LanguageDetectionEnabled:
-          capturedUdidJson?.LanguageDetectionEnabled ?? "",
-        GeoRuleGroupName: capturedUdidJson?.GeoRuleGroupName ?? "",
-        CDNLocation: capturedUdidJson?.CDNLocation ?? "",
-        EnvId: capturedUdidJson?.EnvId ?? "",
-        Domain: udidDomainValue,
-        Id: udidIdValue,
-        TenantGuid: udidTenantGuidValue,
-        UdidFileNameValue: udidFileNameValue,
-        lastPublishingDate: capturedUdidJsonLastModified,
-        isTestScript: isTestUdidScript,
-        scriptScopeValid: udidScriptScopeValid,
-        scriptScopeMessage: udidScriptScopeMessage,
-        CookieSPAEnabled:
-          capturedUdidJson?.CookieSPAEnabled === true,
-        CookieSameSiteNoneEnabled:
-          capturedUdidJson?.CookieSameSiteNoneEnabled === true,
-        RuleSetCount: ruleSetCount,
-        SkipGeolocation: skipGeolocation,
+      // Identifiers
+      dataDomainId: udidIdValue,
+      tenantGuid: udidTenantGuidValue,
+      tenantLocation: capturedUdidJson?.EnvId ?? "",
+
+      // Metadata
+      metadata: {
+        scriptIsFor: udidDomainValue,
+        scriptVersionPublished: capturedUdidJson?.Version ?? "",
+        lastPublishDate: capturedUdidJsonLastModified,
+        consentModel: consentModel,
+        scriptType: capturedUdidJson?.ScriptType ?? "",
+        scriptHosted: scriptHosting.otSdkStub.hostingType === "LOCAL_SITE" 
+          ? "Locally" 
+          : scriptHosting.otSdkStub.hostingType === "ONETRUST_CDN" 
+          ? "CDN" 
+          : "External",
+        cmpSetupMethod: cmpBannerSetupMethod,
+        cdnLocation: capturedUdidJson?.CDNLocation ?? "",
       },
 
-      scriptChecks: {
-        otSdkStubFound: otSdkStubScripts.length > 0,
-        otAutoBlockFound: otAutoBlockScripts.length > 0,
-
-        otCCPAiabFound: otCCPAiabScripts.length > 0,
-        otBannerSdkFound: otBannerSdkScripts.length > 0,
-        otTCFFound: otTCFScripts.length > 0,
-        otGPPFound: otGPPScripts.length > 0,
-
-        otSdkStubInHead,
-        otAutoBlockInHead,
-
-        oneTrustScriptInHead:
-          otSdkStubInHead || otAutoBlockInHead,
-
-        jsFilesBeforeOneTrust:
-          jsScriptsBeforeOneTrust.length > 0,
-
-        jsFilesBeforeOneTrustCount:
-          jsScriptsBeforeOneTrust.length,
-
-        jsFilesBeforeOneTrustList:
-          jsScriptsBeforeOneTrust.map((script) => script.src),
-
-        adsConsentFrameworksBeforeAutoBlock: {
-          found: adsConsentFrameworksBeforeAutoBlock.found,
-          count: adsConsentFrameworksBeforeAutoBlock.count,
-          urls: adsConsentFrameworksBeforeAutoBlock.urls,
-        },
-        gtmBeforeAutoBlock,
-        gtmBeforeAutoBlockRecommendation,
+      // Used publish settings
+      publishSettings: {
+        preventFetchingBanner: isSuppressBanner ? "Enabled" : "Disabled",
+        preventFetchingPreferenceCenter: isSuppressPC ? "Enabled" : "Disabled",
+        sameSiteNone: capturedUdidJson?.CookieSameSiteNoneEnabled ? "Enabled" : "Disabled",
+        refreshPageOnInteraction: bannerRefreshAfterCTA ? "Enabled" : "Disabled",
       },
 
-      scriptHosting,
-
-      cookieAudit,
-
-      oneTrustApiChecks: {
-        oneTrustGlobalFound: oneTrustApiState.oneTrustGlobalFound,
-        getDomainDataAvailable: oneTrustApiState.getDomainDataAvailable,
-        getGeolocationDataAvailable: oneTrustApiState.getGeolocationDataAvailable,
-        dataLayerEventCount: gtagAndDataLayerState.dataLayer.length,
+      // RuleSet and Location
+      ruleSetCount: ruleSetCount,
+      locationLookupTriggered: formatGeolocationDetails(
+        triggerRuleSet.matched,
+        detectedCountry,
+        detectedState
+      ),
+      locationDetails: {
+        country: detectedCountry || "Not detected",
+        state: detectedState || "Not detected",
+        fullData: geolocationData || null,
       },
 
-      versionCheck,
+      // OptanonConsent cookie state
+      bannerCategoryState: optanonConsentParsed.parsed ? optanonConsentParsed.groups : null,
 
-      ruleSetSummary,
-
-      geolocation: {
-        skipped: shouldSkipLocationInfo,
-        reason: shouldSkipLocationInfo
-          ? "RuleSet has one item and SkipGeolocation is true."
-          : "SkipGeolocation is false, so OneTrust.getGeolocationData() was checked.",
-        data: shouldSkipLocationInfo ? null : geolocationData,
-        country: shouldSkipLocationInfo ? "" : detectedCountry,
-        state: shouldSkipLocationInfo ? "" : detectedState,
+      // OneTrust files detected
+      oneTrustFilesDetected: {
+        otSdkStubJs: otSdkStubScripts.length > 0 ? "Yes" : "No",
+        otAutoBlockJs: otAutoBlockScripts.length > 0 ? "Yes" : "No",
+        otCCPAiabJs: otCCPAiabScripts.length > 0 ? "Yes" : "No",
+        otBannerSdkJs: otBannerSdkScripts.length > 0 ? "Yes" : "No",
+        otTCFJs: otTCFScripts.length > 0 ? "Yes" : "No",
+        otGPPJs: otGPPScripts.length > 0 ? "Yes" : "No",
       },
 
-      triggerRuleSet,
-
-      consentModes: {
-        googleConsentModeEnabled,
-        microsoftConsentModeEnabled,
-        amazonConsentModeEnabled,
-        enabledSdkDetails,
+      // Autoblock review (renamed from Ads consent frameworks)
+      autoblockReview: {
+        countBeforeOtAutoblock: adsConsentFrameworkScripts.length,
+        urlsBeforeOtAutoblock: adsConsentFrameworkScripts.map((s) => s.src),
       },
 
+      // Privacy framework notes
+      privacyFrameworkNotes: {
+        usPrivacyStringActive: otCCPAiabScripts.length > 0 ? "Yes" : "No",
+        tcfEnabled: otTCFScripts.length > 0 ? "Yes" : "No",
+        globalPrivacyPlatformEnabled: otGPPScripts.length > 0 ? "Yes" : "No",
+      },
+
+      // Consent mode audits
       googleConsentModeAudit: {
-        optanonAlertBoxClosedExists,
-        gtagDetectedBeforeConsent,
-        gtagDetected,
-        collectionCallsDetected,
-        collectionCallsBeforeConsent,
-        collectionCallUrls: googleAnalyticsCollectionCalls.map((call) => call.url),
-
-        hasGtagFunction: gtagAndDataLayerState.hasGtagFunction,
-        hasDataLayer: gtagAndDataLayerState.hasDataLayer,
-
-        inferredMode: gcmMode.inferredMode,
-        inferredModeMessage: gcmMode.message,
-
-        cmpTemplateTagDetected,
-        cmpBannerSetupMethod,
-        cmpTemplateTagUrl: cmpTemplateTagDetected ? otSdkStubPrimaryUrl : "",
-
-        gcmDefaultsFound: gcmDefaults.gcmDefaultsFound,
-        gcmDefaultEntries: gcmDefaults.gcmDefaultEntries,
-
-        gaCollectionCallsFound,
-        gaCollectionCallCount: googleAnalyticsCollectionCalls.length,
-
-        gcsParameterFound: gcsValues.length > 0,
+        gtagDetected: gtagDetected ? "Yes" : "No",
+        collectionCallsDetected: collectionCallsDetected ? "Yes" : "No",
+        gcsParameterFound: gcsValues.length > 0 ? "Yes" : "No",
         gcsValues: [...new Set(gcsValues)],
-
-        gaCollectionCallsWithoutGcsCount:
-          gaCollectionCallsWithoutGcs.length,
-
-        gaCollectionCallsWithoutGcs:
-          gaCollectionCallsWithoutGcs.map((call) => call.url),
-
-        consentModel,
-
-        defaultValidationStatus: gcsValidation.status,
-        defaultValidationMessage: gcsValidation.message,
-
-        location: {
-          country: detectedCountry,
-          state: detectedState,
-        },
-
-        triggerRuleSet: {
-          matched: triggerRuleSet.matched,
-          matchedRuleIndex: triggerRuleSet.matchedRuleIndex,
-          Name: triggerRuleSet.Name,
-          TemplateName: triggerRuleSet.TemplateName,
-          Type: triggerRuleSet.Type,
-          GCEnable: triggerRuleSet.GCEnable,
-          IsGPPEnabled: triggerRuleSet.IsGPPEnabled,
-        },
+        collectionCallsWithoutGCS: gaCollectionCallsWithoutGcs.length,
+        cmpBannerSetup: cmpBannerSetupMethod,
+        cmpTemplateTagDetected: cmpTemplateTagDetected ? "Yes" : "No",
+        cmpTemplateTagUrl: cmpTemplateTagDetected ? otSdkStubPrimaryUrl : "",
       },
-      amazonConsentModeAudit: amazonConsentModeAudit,
-      microsoftConsentModeAudit: microsoftConsentModeAudit,
+
+      amazonConsentModeAudit: {
+        acmEnabled: amazonConsentModeAudit.acmEnabled ? "Yes" : "No",
+        requestsDetected: amazonConsentModeAudit.requestsExist ? "Yes" : "No",
+        configurationWarning: amazonConsentModeAudit.configurationWarning,
+        storageCategoriesValid: amazonConsentModeAudit.storageTypesCategoriesValid ? "Yes" : "No",
+        validationStatus: amazonConsentModeAudit.validationStatus,
+        message: amazonConsentModeAudit.validationMessage,
+      },
+
+      microsoftConsentModeAudit: {
+        mcmEnabled: microsoftConsentModeAudit.mcmEnabled ? "Yes" : "No",
+        requestsDetected: microsoftConsentModeAudit.requestsExist ? "Yes" : "No",
+        configurationWarning: microsoftConsentModeAudit.configurationWarning,
+        storageCategoriesValid: microsoftConsentModeAudit.storageTypesCategoriesValid ? "Yes" : "No",
+        validationStatus: microsoftConsentModeAudit.validationStatus,
+        message: microsoftConsentModeAudit.validationMessage,
+      },
+
+      // Version
+      versionCheck: {
+        versionStatus: versionCheck.status,
+        latestAvailableVersion: LATEST_AVAILABLE_WORKFLOW_VERSION,
+        warning: versionCheck.warning,
+      },
     };
   } finally {
     if (context) await context.close().catch(() => {});
